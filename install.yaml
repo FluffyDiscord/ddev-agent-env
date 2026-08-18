@@ -1,0 +1,56 @@
+name: agent-env
+
+ddev_version_constraint: '>= v1.24.10'
+
+pre_install_actions:
+  - |
+    #ddev-description:Check for python3 with PyYAML
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+      echo "agent-env needs python3 with PyYAML on the host to read .ddev/agent-env.yaml"
+      exit 1
+    fi
+  - |
+    #ddev-description:Check for the host tools agent-env shells out to
+    missing=""
+    for tool in flock git curl getent docker python3; do
+      command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    if [ -n "$missing" ]; then
+      echo "agent-env needs these host tools:$missing"
+      exit 1
+    fi
+  - |
+    #ddev-description:Check git version (worktree handling needs 2.31+)
+    version=$(git --version | awk '{print $3}')
+    if ! printf '2.31\n%s\n' "$version" | sort -V -C; then
+      echo "agent-env needs git 2.31 or newer (found $version)"
+      exit 1
+    fi
+
+global_files:
+  - commands/host/agent-env
+
+project_files:
+  - agent-env.yaml.example
+
+post_install_actions:
+  - chmod +x ~/.ddev/commands/host/agent-env 2>/dev/null || chmod +x "$(ddev version -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["raw"]["global-ddev-dir"])')/commands/host/agent-env"
+  - |
+    #ddev-description:Keep the add-on manifest out of git so clones cannot uninstall it
+    cd "${DDEV_APPROOT}"
+    touch .gitignore
+    grep -qxF '.ddev/addon-metadata/' .gitignore || echo '.ddev/addon-metadata/' >> .gitignore
+  - |
+    #ddev-description:Point the user at the config template
+    echo ""
+    echo "agent-env installed. Next:"
+    echo "  cp ${DDEV_APPROOT}/.ddev/agent-env.yaml.example ${DDEV_APPROOT}/.ddev/agent-env.yaml"
+    echo "  edit it, then: ddev agent-env create <slug>"
+    echo ""
+    echo "NOTE: the command is installed globally. 'ddev add-on remove agent-env' in ANY"
+    echo "project deletes it for every project on this machine."
+
+removal_actions:
+  - |
+    #ddev-description:Warn that removal is machine-wide
+    echo "agent-env was removed globally; other projects on this machine no longer have 'ddev agent-env'."

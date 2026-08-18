@@ -1,0 +1,27 @@
+#ddev-generated
+# Copy to .ddev/agent-env.yaml and edit. Paths are relative to the project root.
+#
+# Container-side work does NOT belong here. Use DDEV's own hooks: in a tracked
+# config.*.yaml — they already support per-service tasks and fire on every
+# restore, including ones agent-env never sees. See README "Per-service hooks".
+
+copy_paths:
+  derived:
+    - vendor
+    - node_modules
+    - public/build
+
+  materialized:
+    - config/jwt
+    - public/media
+
+env_rewrite_paths:
+  - .env.local
+
+env_redact: []
+
+hooks:
+  post_worktree: []
+  pre_remove: []
+
+max_clones: 8

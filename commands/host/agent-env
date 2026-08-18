@@ -1,0 +1,803 @@
+#!/usr/bin/env bash
+
+## #ddev-generated: If you want to edit and own this file, remove this line.
+## Description: Provision an isolated git worktree + DDEV project so an agent can work without touching the main instance
+## Usage: agent-env <create|list|remove|path|refresh-db> [args]
+## Example: "ddev agent-env create issue-42" or "ddev agent-env list --stale" or "ddev agent-env remove issue-42"
+
+set -euo pipefail
+
+readonly EXIT_NOT_DDEV=1
+readonly EXIT_BAD_SLUG=2
+readonly EXIT_SLUG_IN_USE=3
+readonly EXIT_CAPACITY=4
+readonly EXIT_UNSAFE_PATH=5
+readonly EXIT_NO_SNAPSHOT=6
+readonly EXIT_WORKTREE_ADD=7
+readonly EXIT_SNAPSHOT_COPY=8
+readonly EXIT_START=9
+readonly EXIT_RESTORE=10
+readonly EXIT_HOOK_RESTORE=11
+readonly EXIT_HOOK_HOST=12
+readonly EXIT_VERIFY=13
+readonly EXIT_YAML=14
+readonly EXIT_DNS=15
+readonly EXIT_WRITE=16
+readonly EXIT_COPY=17
+readonly EXIT_REFRESH=18
+readonly EXIT_DELETE=19
+readonly EXIT_LOCKED=20
+readonly EXIT_INSIDE_CLONE=21
+readonly EXIT_UNMERGED_BRANCH=22
+readonly EXIT_DECLINED=23
+readonly EXIT_INTERNAL=24
+
+getWorktreeDiskFloorGb() { echo "${AGENT_ENV_DISK_FLOOR_GB:-10}"; }
+getDockerDiskFloorGb() { echo "${AGENT_ENV_DOCKER_FLOOR_GB:-5}"; }
+getCloneWarnThreshold() { echo "${AGENT_ENV_WARN_CLONES:-4}"; }
+getDefaultMaxClones() { echo "${AGENT_ENV_MAX_CLONES:-8}"; }
+getLockTimeoutSeconds() { echo "${AGENT_ENV_LOCK_TIMEOUT:-600}"; }
+getGoldenSnapshotName() { echo "agent-golden"; }
+getDnsLabelLimit() { echo 63; }
+getMinimumGitVersion() { echo "2.31"; }
+
+fail() { local code=$1; shift; printf '%s\n' "agent-env: $*" >&2; exit "$code"; }
+warn() { printf '%s\n' "agent-env: $*" >&2; }
+info() { printf '%s\n' "$*"; }
+
+rollbackArmed=no
+rollbackWorktree=""
+rollbackBranch=""
+
+runRollback() {
+    [ "$rollbackArmed" = "yes" ] || return 0
+    rollbackArmed=no
+    warn "rolling back the partially created worktree"
+    [ -z "$rollbackWorktree" ] || git -C "$DDEV_APPROOT" worktree remove --force "$rollbackWorktree" >/dev/null 2>&1 || rm -rf "$rollbackWorktree"
+    git -C "$DDEV_APPROOT" worktree prune >/dev/null 2>&1 || true
+    [ -z "$rollbackBranch" ] || git -C "$DDEV_APPROOT" branch -D "$rollbackBranch" >/dev/null 2>&1 || true
+}
+
+onUnhandledError() {
+    local status=$1 line=$2
+    runRollback
+    printf '%s\n' "agent-env: unhandled failure at line $line (status $status)" >&2
+    exit $EXIT_INTERNAL
+}
+
+trap 'onUnhandledError $? $LINENO' ERR
+trap runRollback EXIT
+
+requireDdevContext() {
+    [ -n "${DDEV_APPROOT:-}" ] || fail $EXIT_NOT_DDEV "run this from inside a DDEV project directory"
+    [ -n "${DDEV_PROJECT:-}" ] || fail $EXIT_NOT_DDEV "DDEV_PROJECT is empty; run this from inside a DDEV project directory"
+}
+
+requireHostTooling() {
+    python3 -c 'import yaml' 2>/dev/null || fail $EXIT_YAML "python3 with PyYAML is required to read .ddev/agent-env.yaml"
+
+    local gitVersion minimum
+    gitVersion=$(git --version | awk '{print $3}')
+    minimum=$(getMinimumGitVersion)
+    printf '%s\n%s\n' "$minimum" "$gitVersion" | sort -V -C \
+        || fail $EXIT_YAML "git $minimum or newer is required (found $gitVersion)"
+}
+
+isLinkedWorktree() {
+    local gitDir
+    gitDir=$(git -C "$DDEV_APPROOT" rev-parse --git-dir 2>/dev/null) || return 1
+    case "$gitDir" in */worktrees/*) return 0 ;; *) return 1 ;; esac
+}
+
+refuseInsideLinkedWorktree() {
+    if isLinkedWorktree; then
+        fail $EXIT_INSIDE_CLONE "this is already an agent clone; run agent-env from the source project instead"
+    fi
+}
+
+validateSlug() {
+    local slug=$1
+    local pattern='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    [[ $slug =~ $pattern ]] || fail $EXIT_BAD_SLUG "slug '$slug' must match $pattern"
+
+    local projectName="$DDEV_PROJECT-$slug"
+    local limit
+    limit=$(getDnsLabelLimit)
+    if [ ${#projectName} -gt "$limit" ]; then
+        fail $EXIT_BAD_SLUG "project name '$projectName' is ${#projectName} characters; the DNS label limit is $limit (RFC 1035)"
+    fi
+}
+
+getWorktreeRoot() { echo "$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")-agents"; }
+getWorktreePath() { echo "$(getWorktreeRoot)/$1"; }
+getTargetProject() { echo "$DDEV_PROJECT-$1"; }
+getBranchName() { echo "agent/$1"; }
+getSnapshotDir() { echo "$DDEV_APPROOT/.ddev/db_snapshots"; }
+
+getBaseBranch() {
+    if [ -n "${AGENT_ENV_BASE_BRANCH:-}" ]; then
+        echo "$AGENT_ENV_BASE_BRANCH"
+        return 0
+    fi
+    git -C "$DDEV_APPROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo master
+}
+
+readConfigJson() {
+    local configFile="$DDEV_APPROOT/.ddev/agent-env.yaml"
+    if [ ! -f "$configFile" ]; then
+        warn "no .ddev/agent-env.yaml found; copying .env.local only (see .ddev/agent-env.yaml.example)"
+        echo '{}'
+        return 0
+    fi
+    python3 -c 'import yaml,json,sys; json.dump(yaml.safe_load(sys.stdin.read()) or {}, sys.stdout)' \
+        <"$configFile" 2>/dev/null \
+        || fail $EXIT_YAML "could not parse .ddev/agent-env.yaml"
+}
+
+queryConfig() {
+    local json=$1 filter=$2
+    printf '%s' "$json" | python3 -c '
+import json,sys
+data = json.load(sys.stdin)
+for key in sys.argv[1].split("."):
+    if not isinstance(data, dict):
+        data = None
+        break
+    data = data.get(key)
+if isinstance(data, list):
+    print("\n".join(str(item) for item in data))
+elif data is not None:
+    print(data)
+' "$filter"
+}
+
+getFreeGb() {
+    local avail
+    avail=$(df --output=avail -BG "$1" 2>/dev/null | tail -1 | tr -dc '0-9') || avail=""
+    echo "${avail:-0}"
+}
+
+listProjectsJson() { ddev list -j 2>/dev/null || echo '{"raw":[]}'; }
+
+getRunningCloneCount() {
+    listProjectsJson | python3 -c '
+import json,sys
+raw = json.load(sys.stdin).get("raw", [])
+prefix = sys.argv[1] + "-"
+print(sum(1 for p in raw if str(p.get("name","")).startswith(prefix) and p.get("status") == "running"))
+' "$DDEV_PROJECT"
+}
+
+getProjectStatus() {
+    listProjectsJson | python3 -c '
+import json,sys
+raw = json.load(sys.stdin).get("raw", [])
+print(next((str(p.get("status","?")) for p in raw if p.get("name") == sys.argv[1]), "not registered"))
+' "$1"
+}
+
+isProjectRegistered() {
+    local status
+    status=$(getProjectStatus "$1")
+    [ "$status" != "not registered" ]
+}
+
+getSnapshotFile() {
+    local dir name matches
+    dir=$(getSnapshotDir)
+    name=$(getGoldenSnapshotName)
+    matches=("$dir/$name"-*)
+    [ -e "${matches[0]}" ] || { echo ""; return 0; }
+    echo "${matches[0]}"
+}
+
+recordSnapshotMetadata() {
+    local dir name
+    dir=$(getSnapshotDir)
+    name=$(getGoldenSnapshotName)
+
+    local head migrationsPath
+    head=$(git -C "$DDEV_APPROOT" rev-parse HEAD 2>/dev/null || echo "")
+    migrationsPath=${1:-migrations}
+
+    printf '%s\n' "$head" >"$dir/$name.meta.tmp"
+    mv -f "$dir/$name.meta.tmp" "$dir/$name.meta"
+
+    if [ -d "$DDEV_APPROOT/$migrationsPath" ]; then
+        ( cd "$DDEV_APPROOT/$migrationsPath" && ls -1 ) >"$dir/$name.migrations.tmp" 2>/dev/null || : >"$dir/$name.migrations.tmp"
+        mv -f "$dir/$name.migrations.tmp" "$dir/$name.migrations"
+    fi
+}
+
+takeGoldenSnapshot() {
+    [ "${DDEV_PROJECT_STATUS:-}" = "running" ] \
+        || fail $EXIT_REFRESH "the source project must be running to take a golden snapshot"
+
+    local dir name staging
+    dir=$(getSnapshotDir)
+    name=$(getGoldenSnapshotName)
+    staging="$name-staging-$$"
+
+    ddev snapshot -n "$staging" >/dev/null 2>&1 || fail $EXIT_REFRESH "ddev snapshot failed"
+
+    local produced
+    produced=$(find "$dir" -maxdepth 1 -name "$staging-*" -type f 2>/dev/null | head -1) || produced=""
+    [ -n "$produced" ] || fail $EXIT_REFRESH "ddev snapshot reported success but produced no $staging-* file"
+
+    local suffix
+    suffix=${produced##*/"$staging"-}
+    find "$dir" -maxdepth 1 -type f -name "$name-*" ! -name "$staging-*" -delete 2>/dev/null || true
+    mv -f "$produced" "$dir/$name-$suffix" || fail $EXIT_REFRESH "could not install the golden snapshot"
+
+    local migrationsPath=${1:-migrations}
+    recordSnapshotMetadata "$migrationsPath"
+
+    info "golden snapshot: $name-$suffix"
+}
+
+copyTree() {
+    local source=$1 target=$2
+    mkdir -p "$(dirname "$target")" || fail $EXIT_WRITE "cannot create $(dirname "$target")"
+
+    if cp --reflink=always -a "$source" "$target" 2>/dev/null; then
+        return 0
+    fi
+
+    rm -rf "$target"
+    warn "reflink unavailable for $source; falling back to a full copy (this costs real disk)"
+    cp -a "$source" "$target" || fail $EXIT_COPY "could not copy $source"
+}
+
+copyDeclaredPaths() {
+    local json=$1 worktree=$2 group=$3
+    local relative
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if [ ! -e "$DDEV_APPROOT/$relative" ]; then
+            warn "copy_paths.$group lists '$relative', which does not exist in the source; skipping"
+            continue
+        fi
+        copyTree "$DDEV_APPROOT/$relative" "$worktree/$relative"
+    done < <(queryConfig "$json" "copy_paths.$group")
+}
+
+copyEnvFiles() {
+    local json=$1 worktree=$2 sourceHost=$3 cloneHost=$4 withSecrets=$5
+
+    local paths redactKeys
+    paths=$(queryConfig "$json" "env_rewrite_paths")
+    if [ -z "$paths" ] && [ -f "$DDEV_APPROOT/.env.local" ]; then
+        paths=".env.local"
+    fi
+    redactKeys=$(queryConfig "$json" "env_redact" | paste -sd, -)
+
+    local relative
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if [ ! -f "$DDEV_APPROOT/$relative" ]; then
+            warn "env_rewrite_paths lists '$relative', which does not exist; skipping"
+            continue
+        fi
+        mkdir -p "$(dirname "$worktree/$relative")"
+        SOURCE_HOST="$sourceHost" CLONE_HOST="$cloneHost" REDACT="$redactKeys" WITH_SECRETS="$withSecrets" \
+            python3 -c '
+import os, shutil, sys
+
+source, target = sys.argv[1], sys.argv[2]
+text = open(source).read().replace(os.environ["SOURCE_HOST"], os.environ["CLONE_HOST"])
+
+if os.environ.get("WITH_SECRETS") != "yes":
+    keys = set(filter(None, os.environ.get("REDACT", "").split(",")))
+
+    def redact(line):
+        head, separator, _ = line.partition("=")
+        if not separator:
+            return line
+        name = head.strip()
+        prefix = ""
+        if name.startswith("export "):
+            prefix, name = "export ", name[len("export "):].strip()
+        if name not in keys:
+            return line
+        indent = head[:len(head) - len(head.lstrip())]
+        return indent + prefix + name + "=REDACTED-IN-CLONE"
+
+    text = "\n".join(redact(line) for line in text.split("\n"))
+
+open(target, "w").write(text)
+shutil.copymode(source, target)
+' "$DDEV_APPROOT/$relative" "$worktree/$relative" \
+            || fail $EXIT_COPY "could not rewrite $relative"
+    done <<<"$paths"
+}
+
+writeCloneConfig() {
+    local worktree=$1 target=$2
+
+    if [ -f "$DDEV_APPROOT/.ddev/.gitignore" ]; then
+        cp -a "$DDEV_APPROOT/.ddev/.gitignore" "$worktree/.ddev/.gitignore"
+        sed -i '1{/#ddev-generated/d}' "$worktree/.ddev/.gitignore"
+    fi
+
+    cat >"$worktree/.ddev/config.local.yaml" <<YAML || fail $EXIT_WRITE "cannot write config.local.yaml"
+name: $target
+fail_on_hook_fail: true
+YAML
+
+    cat >"$worktree/.ddev/docker-compose.agentgit.yaml" <<YAML || fail $EXIT_WRITE "cannot write docker-compose.agentgit.yaml"
+services:
+  web:
+    volumes:
+      - $DDEV_APPROOT/.git:$DDEV_APPROOT/.git
+YAML
+
+    appendGitignoreEntry "$worktree" '/docker-compose.agentgit.yaml'
+    appendGitignoreEntry "$worktree" '/config.local.yaml'
+
+    git -C "$DDEV_APPROOT" config extensions.worktreeConfig true
+    git -C "$worktree" config --worktree gc.auto 0
+    git -C "$worktree" config --worktree gc.worktreePruneExpire never
+    git -C "$worktree" config --worktree maintenance.auto false
+}
+
+appendGitignoreEntry() {
+    local worktree=$1 entry=$2
+    local file="$worktree/.ddev/.gitignore"
+    touch "$file"
+    grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
+}
+
+reportMigrationSkew() {
+    local worktree=$1 migrationsPath=$2
+    local record
+    record="$(getSnapshotDir)/$(getGoldenSnapshotName).migrations"
+    [ -f "$record" ] || return 0
+    [ -d "$worktree/$migrationsPath" ] || return 0
+
+    local branchList onlyInSnapshot onlyInBranch
+    branchList=$( cd "$worktree/$migrationsPath" && ls -1 2>/dev/null || true )
+    onlyInSnapshot=$(comm -23 <(sort "$record") <(printf '%s\n' "$branchList" | sort) | grep -c . || true)
+    onlyInBranch=$(comm -13 <(sort "$record") <(printf '%s\n' "$branchList" | sort) | grep -c . || true)
+
+    if [ "$onlyInSnapshot" -gt 0 ]; then
+        warn "$onlyInSnapshot migration(s) were present when the golden snapshot was taken but are absent from this branch"
+        warn "the clone's database is AHEAD of its code; doctrine:migrations:diff would invent duplicates"
+    fi
+    if [ "$onlyInBranch" -gt 0 ]; then
+        warn "$onlyInBranch migration(s) exist on this branch but not when the snapshot was taken"
+        warn "run your migration command inside the clone before relying on the schema"
+    fi
+}
+
+runHostHooks() {
+    local json=$1 worktree=$2 stage=$3
+    local command
+    while IFS= read -r command; do
+        [ -n "$command" ] || continue
+        info "hooks.$stage: $command"
+        ( cd "$worktree" && exec 9>&- 0</dev/null; bash -c "$command" ) \
+            || fail $EXIT_HOOK_HOST "hooks.$stage failed: $command"
+    done < <(queryConfig "$json" "hooks.$stage")
+}
+
+getPrimaryUrl() {
+    local worktree=$1 url
+    url=$( cd "$worktree" && ddev describe -j 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["raw"]["primary_url"])' 2>/dev/null ) || url=""
+    echo "$url"
+}
+
+verifyClone() {
+    local worktree=$1 started=$2 restored=$3 json=$4 fresh=$5 noStart=$6
+    local skipped=""
+
+    if [ "$started" = "yes" ]; then
+        ( cd "$worktree" && ddev exec git rev-parse --git-dir >/dev/null 2>&1 ) \
+            || fail $EXIT_VERIFY "git is not usable inside the clone's web container"
+    else
+        git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1 \
+            || fail $EXIT_VERIFY "git is not usable in the worktree"
+    fi
+
+    local missing="" group relative
+    for group in derived materialized; do
+        while IFS= read -r relative; do
+            [ -n "$relative" ] || continue
+            [ -e "$DDEV_APPROOT/$relative" ] || continue
+            [ -e "$worktree/$relative" ] || missing="$missing $relative"
+        done < <(queryConfig "$json" "copy_paths.$group")
+    done
+    [ -z "$missing" ] || fail $EXIT_VERIFY "declared paths are missing from the clone:$missing"
+
+    if [ "$started" = "yes" ] && [ "$restored" = "yes" ]; then
+        local url status
+        url=$(getPrimaryUrl "$worktree")
+        [ -n "$url" ] || fail $EXIT_VERIFY "could not read the clone's primary URL from ddev describe"
+        status=$(curl -sk -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || status=000
+        [ "$status" = "200" ] \
+            || fail $EXIT_VERIFY "$url returned $status; the clone is not ready (restored data still pointing at the source project's hostname is the usual cause — see post-restore-snapshot hooks)"
+    fi
+
+    [ "$noStart" != "yes" ] || skipped="$skipped --no-start"
+    [ "$fresh" != "yes" ] || skipped="$skipped --fresh"
+    [ -z "$skipped" ] || info "verification skipped:$skipped — clone not smoke-tested"
+}
+
+commandCreate() {
+    local slug="" from="HEAD" fresh="no" freshDeps="no" force="no" noStart="no" withSecrets="no"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) [ $# -ge 2 ] || fail $EXIT_BAD_SLUG "--from requires a value"; from=$2; shift 2 ;;
+            --fresh) fresh=yes; shift ;;
+            --fresh-deps) freshDeps=yes; shift ;;
+            --with-secrets) withSecrets=yes; shift ;;
+            --force) force=yes; shift ;;
+            --no-start) noStart=yes; shift ;;
+            -*) fail $EXIT_BAD_SLUG "unknown flag $1" ;;
+            *) [ -z "$slug" ] || fail $EXIT_BAD_SLUG "unexpected argument '$1'"; slug=$1; shift ;;
+        esac
+    done
+
+    [ -n "$slug" ] || fail $EXIT_BAD_SLUG "usage: ddev agent-env create <slug>"
+    validateSlug "$slug"
+    refuseInsideLinkedWorktree
+    requireHostTooling
+
+    exec 0</dev/null
+
+    local worktree target branch
+    worktree=$(getWorktreePath "$slug")
+    target=$(getTargetProject "$slug")
+    branch=$(getBranchName "$slug")
+
+    [ ! -e "$worktree" ] || fail $EXIT_SLUG_IN_USE "$worktree already exists; use 'ddev agent-env remove $slug'"
+    ! git -C "$DDEV_APPROOT" rev-parse --verify "$branch" >/dev/null 2>&1 \
+        || fail $EXIT_SLUG_IN_USE "branch $branch already exists; remove it or choose another slug"
+    ! isProjectRegistered "$target" \
+        || fail $EXIT_SLUG_IN_USE "DDEV project $target is already registered; run 'ddev agent-env list --stale'"
+
+    mkdir -p "$(getWorktreeRoot)"
+
+    local worktreeFree dockerRoot dockerFree floor dockerFloor
+    worktreeFree=$(getFreeGb "$(getWorktreeRoot)")
+    dockerRoot=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || dockerRoot=/var/lib/docker
+    dockerFree=$(getFreeGb "$dockerRoot")
+    floor=$(getWorktreeDiskFloorGb)
+    dockerFloor=$(getDockerDiskFloorGb)
+
+    if [ "$force" != "yes" ]; then
+        [ "$worktreeFree" -ge "$floor" ] \
+            || fail $EXIT_CAPACITY "only ${worktreeFree}GB free on $(getWorktreeRoot); the floor is ${floor}GB (override with --force)"
+        [ "$dockerFree" -ge "$dockerFloor" ] \
+            || fail $EXIT_CAPACITY "only ${dockerFree}GB free on $dockerRoot; the floor is ${dockerFloor}GB (override with --force)"
+    fi
+
+    local json running maxClones warnAt migrationsPath
+    json=$(readConfigJson)
+    running=$(getRunningCloneCount)
+    maxClones=$(queryConfig "$json" "max_clones"); maxClones=${maxClones:-$(getDefaultMaxClones)}
+    warnAt=$(getCloneWarnThreshold)
+    migrationsPath=$(queryConfig "$json" "migrations_path"); migrationsPath=${migrationsPath:-migrations}
+
+    if [ "$force" != "yes" ] && [ "$running" -ge "$maxClones" ]; then
+        fail $EXIT_CAPACITY "$running clones already running; max_clones is $maxClones (override with --force)"
+    fi
+    [ "$running" -lt "$warnAt" ] || warn "$running clones already running; each web+db pair costs roughly 1-2GB of RAM"
+
+    if ! getent hosts "$target.${DDEV_TLD:-ddev.site}" >/dev/null 2>&1 && [ "$force" != "yes" ]; then
+        fail $EXIT_DNS "$target.${DDEV_TLD:-ddev.site} does not resolve; ddev would fall back to editing /etc/hosts, which needs sudo (override with --force)"
+    fi
+
+    local snapshot=""
+    if [ "$fresh" != "yes" ]; then
+        snapshot=$(getSnapshotFile)
+        if [ -z "$snapshot" ]; then
+            [ "${DDEV_PROJECT_STATUS:-}" = "running" ] \
+                || fail $EXIT_NO_SNAPSHOT "no golden snapshot and the source project is not running; start it, run 'ddev agent-env refresh-db', or pass --fresh"
+            takeGoldenSnapshot "$migrationsPath"
+            snapshot=$(getSnapshotFile)
+        fi
+    fi
+
+    local dirty
+    dirty=$(git -C "$DDEV_APPROOT" status --porcelain | wc -l)
+    [ "$dirty" -eq 0 ] || warn "main has $dirty uncommitted change(s); the clone starts from $from and will not contain them"
+
+    if ! git -C "$DDEV_APPROOT" worktree add "$worktree" -b "$branch" "$from"; then
+        git -C "$DDEV_APPROOT" worktree prune >/dev/null 2>&1 || true
+        git -C "$DDEV_APPROOT" branch -D "$branch" >/dev/null 2>&1 || true
+        fail $EXIT_WORKTREE_ADD "git worktree add failed"
+    fi
+
+    rollbackArmed=yes
+    rollbackWorktree="$worktree"
+    rollbackBranch="$branch"
+
+    writeCloneConfig "$worktree" "$target"
+
+    local sourceHost cloneHost
+    sourceHost="${DDEV_HOSTNAME:-$DDEV_PROJECT.${DDEV_TLD:-ddev.site}}"
+    cloneHost="$target.${DDEV_TLD:-ddev.site}"
+
+    [ "$freshDeps" = "yes" ] || copyDeclaredPaths "$json" "$worktree" derived
+    copyDeclaredPaths "$json" "$worktree" materialized
+    copyEnvFiles "$json" "$worktree" "$sourceHost" "$cloneHost" "$withSecrets"
+
+    if [ -n "$snapshot" ]; then
+        mkdir -p "$worktree/.ddev/db_snapshots"
+        cp -a "$snapshot" "$worktree/.ddev/db_snapshots/" || fail $EXIT_SNAPSHOT_COPY "could not copy the golden snapshot"
+    fi
+
+    rollbackArmed=no
+
+    if [ "$noStart" = "yes" ]; then
+        verifyClone "$worktree" no no "$json" "$fresh" "$noStart"
+        info "worktree: $worktree"
+        info "project:  $target (not started)"
+        return 0
+    fi
+
+    ( cd "$worktree" && ddev start -y ) \
+        || fail $EXIT_START "ddev start failed in $worktree; run 'ddev agent-env remove $slug' to clean up"
+
+    local restored=no
+    if [ -n "$snapshot" ]; then
+        local restoreLog restoreStatus
+        restoreLog=$(mktemp)
+        set +e
+        ( cd "$worktree" && ddev snapshot restore "$(getGoldenSnapshotName)" ) >"$restoreLog" 2>&1
+        restoreStatus=$?
+        set -e
+        if [ $restoreStatus -ne 0 ]; then
+            cat "$restoreLog" >&2
+            if grep -qiE 'hook|task failed' "$restoreLog"; then
+                rm -f "$restoreLog"
+                fail $EXIT_HOOK_RESTORE "a post-restore-snapshot hook failed in the clone; the database is restored but unfixed"
+            fi
+            rm -f "$restoreLog"
+            fail $EXIT_RESTORE "ddev snapshot restore failed"
+        fi
+        rm -f "$restoreLog"
+        restored=yes
+        reportMigrationSkew "$worktree" "$migrationsPath"
+    fi
+
+    if [ "$freshDeps" = "yes" ]; then
+        ( cd "$worktree" && ddev composer install --no-interaction && ddev npm ci && ddev npm run build ) \
+            || fail $EXIT_HOOK_HOST "--fresh-deps install failed"
+        ( cd "$worktree" && ddev restart -y ) || fail $EXIT_START "ddev restart after --fresh-deps failed"
+    fi
+
+    runHostHooks "$json" "$worktree" post_worktree
+    verifyClone "$worktree" yes "$restored" "$json" "$fresh" "$noStart"
+
+    local url
+    url=$(getPrimaryUrl "$worktree")
+    info ""
+    info "worktree: $worktree"
+    info "project:  $target"
+    info "branch:   $branch"
+    info "url:      ${url:-unknown}"
+}
+
+commandList() {
+    local stale="no"
+    [ "${1:-}" != "--stale" ] || stale=yes
+
+    local root
+    root=$(getWorktreeRoot)
+
+    printf '%-16s %-12s %-26s %-22s %-10s %s\n' SLUG STATUS PROJECT BRANCH AHEAD/BEHIND PATH
+    local dir slug target status branch counts base
+    base=$(getBaseBranch)
+    if [ -d "$root" ]; then
+        for dir in "$root"/*/; do
+            [ -d "$dir" ] || continue
+            slug=$(basename "$dir")
+            target=$(getTargetProject "$slug")
+            status=$(getProjectStatus "$target")
+            branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="?"
+            counts=$(git -C "$dir" rev-list --left-right --count "refs/heads/$base...HEAD" 2>/dev/null | tr '\t' '/') || counts="?"
+            printf '%-16s %-12s %-26s %-22s %-10s %s\n' "$slug" "$status" "$target" "$branch" "${counts:-?}" "$dir"
+        done
+    fi
+
+    [ "$stale" = "yes" ] || return 0
+
+    info ""
+    info "stale: DDEV project registered, worktree gone"
+    listProjectsJson | python3 -c '
+import json,os,sys
+raw = json.load(sys.stdin).get("raw", [])
+prefix, root = sys.argv[1] + "-", sys.argv[2]
+for project in raw:
+    name = str(project.get("name",""))
+    if name.startswith(prefix) and not os.path.isdir(os.path.join(root, name[len(prefix):])):
+        print("  " + name)
+' "$DDEV_PROJECT" "$root"
+
+    info ""
+    info "stale: worktree present, DDEV project not registered"
+    if [ -d "$root" ]; then
+        for dir in "$root"/*/; do
+            [ -d "$dir" ] || continue
+            slug=$(basename "$dir")
+            isProjectRegistered "$(getTargetProject "$slug")" || info "  $slug ($dir)"
+        done
+    fi
+}
+
+commandPath() {
+    local slug=${1:-}
+    [ -n "$slug" ] || fail $EXIT_BAD_SLUG "usage: ddev agent-env path <slug>"
+    validateSlug "$slug"
+
+    local worktree
+    worktree=$(getWorktreePath "$slug")
+    [ -d "$worktree" ] || fail $EXIT_SLUG_IN_USE "no worktree for slug '$slug'"
+    echo "$worktree"
+}
+
+confirmRemoval() {
+    local target=$1 worktree=$2
+    printf 'Remove clone %s, its database, and %s? [y/N] ' "$target" "$worktree"
+    local answer=""
+    read -r answer </dev/tty 2>/dev/null || answer=n
+    case "$answer" in
+        y|Y|yes) return 0 ;;
+        *) fail $EXIT_DECLINED "aborted" ;;
+    esac
+}
+
+commandRemove() {
+    local slug="" keepBranch="no" assumeYes="no" forceBranch="no"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep-branch) keepBranch=yes; shift ;;
+            --force-delete-branch) forceBranch=yes; shift ;;
+            --yes|-y) assumeYes=yes; shift ;;
+            -*) fail $EXIT_BAD_SLUG "unknown flag $1" ;;
+            *) [ -z "$slug" ] || fail $EXIT_BAD_SLUG "unexpected argument '$1'"; slug=$1; shift ;;
+        esac
+    done
+
+    [ -n "$slug" ] || fail $EXIT_BAD_SLUG "usage: ddev agent-env remove <slug>"
+    validateSlug "$slug"
+
+    local worktree target branch root
+    worktree=$(getWorktreePath "$slug")
+    target=$(getTargetProject "$slug")
+    branch=$(getBranchName "$slug")
+    root=$(getWorktreeRoot)
+
+    if [ ! -d "$worktree" ] && ! isProjectRegistered "$target"; then
+        fail $EXIT_SLUG_IN_USE "nothing to remove for slug '$slug'"
+    fi
+
+    local tip="" unmerged=0
+    if git -C "$DDEV_APPROOT" rev-parse --verify "$branch" >/dev/null 2>&1; then
+        tip=$(git -C "$DDEV_APPROOT" rev-parse "$branch")
+        local base
+        base=$(getBaseBranch)
+        unmerged=$(git -C "$DDEV_APPROOT" rev-list --count "$branch" --not --remotes "refs/heads/$base" 2>/dev/null) || unmerged=0
+        if [ "$unmerged" -gt 0 ] && [ "$keepBranch" != "yes" ] && [ "$forceBranch" != "yes" ]; then
+            fail $EXIT_UNMERGED_BRANCH "$branch has $unmerged commit(s) not in $base (tip $tip); pass --force-delete-branch to discard them or --keep-branch to keep the branch"
+        fi
+    fi
+
+    [ "$assumeYes" = "yes" ] || confirmRemoval "$target" "$worktree"
+
+    local json
+    json=$(readConfigJson)
+    [ ! -d "$worktree" ] || runHostHooks "$json" "$worktree" pre_remove
+
+    local removedProject=no removedWorktree=no removedBranch=no
+    if isProjectRegistered "$target"; then
+        ddev delete -Oy "$target" >/dev/null || fail $EXIT_DELETE "ddev delete failed for $target; nothing else was removed"
+        removedProject=yes
+    fi
+
+    if [ -d "$worktree" ]; then
+        case "$worktree" in
+            "$root"/*) ;;
+            *) fail $EXIT_UNSAFE_PATH "refusing to remove '$worktree': it is outside $root" ;;
+        esac
+        git -C "$DDEV_APPROOT" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+        if [ -d "$worktree" ]; then
+            rm -rf "$worktree" || fail $EXIT_DELETE "could not remove $worktree"
+        fi
+        removedWorktree=yes
+    fi
+    git -C "$DDEV_APPROOT" worktree prune >/dev/null 2>&1 || true
+
+    if [ "$keepBranch" != "yes" ] && git -C "$DDEV_APPROOT" rev-parse --verify "$branch" >/dev/null 2>&1; then
+        info "branch $branch tip was $tip (recoverable via git reflog)"
+        git -C "$DDEV_APPROOT" branch -D "$branch" >/dev/null && removedBranch=yes
+    fi
+
+    info "removed: project=$removedProject worktree=$removedWorktree branch=$removedBranch"
+}
+
+commandHelp() {
+    cat <<'HELP'
+ddev agent-env — give an AI agent its own git worktree and DDEV project, cloned
+from this one, so several agents can build and test in parallel without touching
+your main instance. Each clone is a fresh branch, its own database (restored from
+a shared golden snapshot), and copy-on-write copies of vendor / media / build.
+
+Usage: ddev agent-env <command> [args]
+
+Commands:
+  create <slug>    Clone the project into ../<project>-agents/<slug> on a new
+                   agent/<slug> branch, as DDEV project <project>-<slug>: database
+                   restored from the golden snapshot, then started and smoke-tested.
+  list [--stale]   List clones and their status. --stale also shows orphans (a DDEV
+                   project with no worktree, or a worktree with no DDEV project).
+  path <slug>      Print the clone's worktree path — cd into it to start working.
+  remove <slug>    Delete the clone: its DDEV project, database, worktree, and branch.
+  refresh-db       Retake the golden snapshot from the running source project. Run
+                   after schema or seed-data changes so new clones start current.
+
+create flags:
+  --from <ref>     Branch the worktree from <ref> instead of HEAD.
+  --fresh          Start with an empty database (skip the snapshot restore).
+  --fresh-deps     Reinstall deps (composer install / npm ci / build) instead of copying.
+  --with-secrets   Keep real secret values instead of redacting them in the clone.
+  --no-start       Create the worktree but do not start DDEV.
+  --force          Override the disk-space, clone-count, and DNS safety checks.
+
+remove flags:
+  --yes                  Do not prompt for confirmation.
+  --keep-branch          Remove the clone but keep its agent/<slug> branch.
+  --force-delete-branch  Delete the branch even if it has unmerged commits.
+
+Typical flow:
+  ddev agent-env create issue-42
+  cd "$(ddev agent-env path issue-42)"   # the agent works here
+  ddev agent-env remove issue-42
+
+What gets cloned is declared in .ddev/agent-env.yaml (deps and files to copy, env
+values to rewrite or redact). Container-side setup (DB fixups, reindexing) goes in
+.ddev/config.*.yaml hooks, not there.
+
+Base branch for the unmerged-commit check: $AGENT_ENV_BASE_BRANCH
+(default: the source project's current branch).
+HELP
+}
+
+withLock() {
+    local lockFile="$DDEV_APPROOT/.ddev/db_snapshots/.agent-env.lock"
+    mkdir -p "$(dirname "$lockFile")"
+    exec 9>"$lockFile"
+    flock -w "$(getLockTimeoutSeconds)" 9 \
+        || fail $EXIT_LOCKED "another agent-env run holds the lock on $lockFile"
+}
+
+main() {
+    requireDdevContext
+
+    local subcommand=${1:-}
+    [ $# -eq 0 ] || shift
+
+    case "$subcommand" in
+        list) commandList "$@" ;;
+        path) commandPath "$@" ;;
+        create) withLock; commandCreate "$@" ;;
+        remove) commandRemove "$@" ;;
+        refresh-db)
+            requireHostTooling
+            withLock
+            local json migrationsPath
+            json=$(readConfigJson)
+            migrationsPath=$(queryConfig "$json" "migrations_path"); migrationsPath=${migrationsPath:-migrations}
+            takeGoldenSnapshot "$migrationsPath"
+            ;;
+        ""|-h|--help|help) commandHelp ;;
+        *) fail $EXIT_BAD_SLUG "unknown subcommand '$subcommand'" ;;
+    esac
+}
+
+if [ "${AGENT_ENV_LIBRARY_ONLY:-}" != "1" ]; then
+    main "$@"
+fi
