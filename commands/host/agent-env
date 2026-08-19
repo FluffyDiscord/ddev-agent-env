@@ -37,6 +37,11 @@ getDockerDiskFloorGb() { echo "${AGENT_ENV_DOCKER_FLOOR_GB:-5}"; }
 getCloneWarnThreshold() { echo "${AGENT_ENV_WARN_CLONES:-4}"; }
 getDefaultMaxClones() { echo "${AGENT_ENV_MAX_CLONES:-8}"; }
 getLockTimeoutSeconds() { echo "${AGENT_ENV_LOCK_TIMEOUT:-600}"; }
+getSelectionTimeoutSeconds() {
+    local seconds="${AGENT_ENV_SELECT_TIMEOUT:-60}"
+    [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=60
+    echo "$seconds"
+}
 getGoldenSnapshotName() { echo "agent-golden"; }
 getDnsLabelLimit() { echo 63; }
 getMinimumGitVersion() { echo "2.31"; }
@@ -48,6 +53,7 @@ info() { printf '%s\n' "$*"; }
 rollbackArmed=no
 rollbackWorktree=""
 rollbackBranch=""
+pickedSlugs=()
 
 runRollback() {
     [ "$rollbackArmed" = "yes" ] || return 0
@@ -112,6 +118,7 @@ getWorktreeRoot() { echo "$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")
 getWorktreePath() { echo "$(getWorktreeRoot)/$1"; }
 getTargetProject() { echo "$DDEV_PROJECT-$1"; }
 getBranchName() { echo "agent/$1"; }
+getCloneNetworkName() { echo "ddev-$1_default"; }
 getSnapshotDir() { echo "$DDEV_APPROOT/.ddev/db_snapshots"; }
 
 getBaseBranch() {
@@ -180,6 +187,53 @@ isProjectRegistered() {
     local status
     status=$(getProjectStatus "$1")
     [ "$status" != "not registered" ]
+}
+
+cloneNetworkExists() {
+    local network
+    network=$(getCloneNetworkName "$1")
+    docker network inspect "$network" >/dev/null 2>&1
+}
+
+removeCloneNetwork() {
+    local target=$1 network
+    network=$(getCloneNetworkName "$target")
+    cloneNetworkExists "$target" || return 1
+    if docker network rm "$network" >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "leftover Docker network $network could not be removed; detach its containers, then run 'docker network rm $network'"
+    return 1
+}
+
+getCloneNetworkPrefix() { echo "ddev-$DDEV_PROJECT-"; }
+
+listCloneNetworkNames() {
+    docker network ls --format '{{.Name}}' --filter "name=$(getCloneNetworkPrefix)" 2>/dev/null || true
+}
+
+filterLeakedCloneNetworks() {
+    local networks=$1 registeredProjects=$2 clonePrefix=$3
+    printf '%s' "$networks" | python3 -c '
+import sys
+registered = set(filter(None, sys.argv[1].split("\n")))
+prefix = sys.argv[2]
+for network in sys.stdin.read().split("\n"):
+    network = network.strip()
+    if not network.startswith(prefix) or not network.endswith("_default"):
+        continue
+    project = network[len("ddev-"):-len("_default")]
+    if project not in registered:
+        print(network)
+' "$registeredProjects" "$clonePrefix"
+}
+
+listRegisteredProjectNames() {
+    listProjectsJson | python3 -c '
+import json,sys
+raw = json.load(sys.stdin).get("raw", [])
+print("\n".join(str(project.get("name","")) for project in raw))
+'
 }
 
 getSnapshotFile() {
@@ -625,6 +679,20 @@ for project in raw:
             isProjectRegistered "$(getTargetProject "$slug")" || info "  $slug ($dir)"
         done
     fi
+
+    info ""
+    info "stale: Docker network present, no DDEV project (each holds one address block)"
+    local networks registered leaked network prefix
+    networks=$(listCloneNetworkNames)
+    registered=$(listRegisteredProjectNames)
+    prefix=$(getCloneNetworkPrefix)
+    leaked=$(filterLeakedCloneNetworks "$networks" "$registered" "$prefix")
+    while IFS= read -r network; do
+        [ -n "$network" ] || continue
+        slug=${network#"$prefix"}
+        slug=${slug%_default}
+        info "  $network (remove with 'ddev agent-env remove $slug')"
+    done <<<"$leaked"
 }
 
 commandPath() {
@@ -649,53 +717,238 @@ confirmRemoval() {
     esac
 }
 
-commandRemove() {
-    local slug="" keepBranch="no" assumeYes="no" forceBranch="no"
+listCloneSlugs() {
+    local root dir
+    root=$(getWorktreeRoot)
+    [ -d "$root" ] || return 0
+    for dir in "$root"/*/; do
+        [ -d "$dir" ] || continue
+        basename "$dir"
+    done
+}
 
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --keep-branch) keepBranch=yes; shift ;;
-            --force-delete-branch) forceBranch=yes; shift ;;
-            --yes|-y) assumeYes=yes; shift ;;
-            -*) fail $EXIT_BAD_SLUG "unknown flag $1" ;;
-            *) [ -z "$slug" ] || fail $EXIT_BAD_SLUG "unexpected argument '$1'"; slug=$1; shift ;;
+resolveCloneSelections() {
+    local answer=$1 count=$2
+    local normalized=${answer//,/ }
+    local leftover=${normalized//[0-9 ]/}
+    if [ -n "$leftover" ]; then
+        echo INVALID
+        return 0
+    fi
+
+    local token index seen=" " out=""
+    for token in $normalized; do
+        if [ "${#token}" -gt 4 ]; then
+            echo INVALID
+            return 0
+        fi
+        index=$((10#$token))
+        if [ "$index" -lt 1 ] || [ "$index" -gt "$count" ]; then
+            echo INVALID
+            return 0
+        fi
+        case "$seen" in
+            *" $index "*) ;;
+            *) out="$out$index "; seen="$seen$index " ;;
         esac
     done
 
-    [ -n "$slug" ] || fail $EXIT_BAD_SLUG "usage: ddev agent-env remove <slug>"
-    validateSlug "$slug"
+    if [ -z "$out" ]; then
+        echo CANCEL
+        return 0
+    fi
+    echo "${out% }"
+}
 
+pythonCursesSelect() {
+    python3 -c '
+import os, sys
+
+try:
+    import curses
+except Exception:
+    sys.exit(4)
+
+rows = sys.argv[1:]
+if not rows:
+    sys.exit(4)
+
+try:
+    saved = os.dup(1)
+    tty = os.open("/dev/tty", os.O_RDWR)
+    os.dup2(tty, 0)
+    os.dup2(tty, 1)
+except OSError:
+    sys.exit(4)
+
+result = [None]
+
+def loop(screen):
+    curses.curs_set(0)
+    position = 0
+    checked = set()
+    header = "Remove which agent clones?   up/down move   space toggle   a all   enter confirm   q cancel"
+    while True:
+        screen.erase()
+        width = curses.COLS - 1 if curses.COLS > 1 else 1
+        screen.addnstr(0, 0, header, width, curses.A_BOLD)
+        for index, row in enumerate(rows):
+            line = index + 2
+            if line >= curses.LINES:
+                break
+            slug, _, branch = row.partition("\t")
+            box = "[x]" if index in checked else "[ ]"
+            cursor = ">" if index == position else " "
+            text = "{} {} {:<24} {}".format(cursor, box, slug, branch)
+            attribute = curses.A_REVERSE if index == position else curses.A_NORMAL
+            screen.addnstr(line, 0, text, width, attribute)
+        screen.refresh()
+        key = screen.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            position = (position - 1) % len(rows)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            position = (position + 1) % len(rows)
+        elif key == ord(" "):
+            checked.symmetric_difference_update({position})
+        elif key == ord("a"):
+            if len(checked) == len(rows):
+                checked.clear()
+            else:
+                checked = set(range(len(rows)))
+        elif key in (curses.KEY_ENTER, 10, 13):
+            result[0] = sorted(checked) if checked else [position]
+            return
+        elif key in (27, ord("q")):
+            return
+
+try:
+    curses.wrapper(loop)
+except KeyboardInterrupt:
+    sys.exit(2)
+except Exception:
+    sys.exit(4)
+
+if not result[0]:
+    sys.exit(2)
+
+os.write(saved, (" ".join(str(index + 1) for index in result[0]) + "\n").encode())
+sys.exit(0)
+' "$@"
+}
+
+runCursesPicker() {
+    local index status=0
+    index=$(pythonCursesSelect "$@") || status=$?
+    case "$status" in
+        0) printf '%s\n' "$index" ;;
+        2) echo CANCEL ;;
+        *) echo UNAVAILABLE ;;
+    esac
+}
+
+runNumberedPicker() {
+    local rows=("$@")
+    printf 'Agent clones under %s:\n' "$(getWorktreeRoot)" >&2
+    local number=1 row slug branch
+    for row in "${rows[@]}"; do
+        slug=${row%%$'\t'*}
+        branch=${row#*$'\t'}
+        printf '  %2d) %-24s %s\n' "$number" "$slug" "$branch" >&2
+        number=$((number + 1))
+    done
+    printf 'Select clones to remove [1-%d, space/comma separated], or Enter to cancel: ' "${#rows[@]}" >&2
+
+    local answer=""
+    read -r -t "$(getSelectionTimeoutSeconds)" answer </dev/tty 2>/dev/null || answer=""
+    resolveCloneSelections "$answer" "${#rows[@]}"
+}
+
+pickCloneInteractively() {
+    local slugs=() slug
+    while IFS= read -r slug; do
+        [ -n "$slug" ] || continue
+        slugs+=("$slug")
+    done < <(listCloneSlugs)
+
+    [ "${#slugs[@]}" -gt 0 ] \
+        || fail $EXIT_SLUG_IN_USE "no worktree-backed clones to remove (see 'ddev agent-env list --stale' for orphaned projects)"
+
+    : </dev/tty 2>/dev/null \
+        || fail $EXIT_BAD_SLUG "no terminal for interactive selection; pass a slug or use --no-interactive"
+
+    local rows=() branch
+    for slug in "${slugs[@]}"; do
+        branch=$(git -C "$(getWorktreePath "$slug")" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="?"
+        rows+=("$slug"$'\t'"$branch")
+    done
+
+    local selection
+    selection=$(runCursesPicker "${rows[@]}")
+    if [ "$selection" = "UNAVAILABLE" ]; then
+        selection=$(runNumberedPicker "${rows[@]}")
+    fi
+
+    case "$selection" in
+        CANCEL) fail $EXIT_DECLINED "aborted" ;;
+        ''|*[!0-9[:space:]]*) fail $EXIT_BAD_SLUG "invalid selection" ;;
+    esac
+
+    pickedSlugs=()
+    local picked
+    for picked in $selection; do
+        pickedSlugs+=("${slugs[$((picked - 1))]}")
+    done
+
+    [ "${#pickedSlugs[@]}" -gt 0 ] || fail $EXIT_DECLINED "aborted"
+}
+
+confirmRemovals() {
+    local slugs=("$@")
+
+    if [ "${#slugs[@]}" -eq 1 ]; then
+        local only=${slugs[0]}
+        confirmRemoval "$(getTargetProject "$only")" "$(getWorktreePath "$only")"
+        return 0
+    fi
+
+    printf 'Remove these %d clones, their databases, and worktrees?\n' "${#slugs[@]}" >&2
+    local slug
+    for slug in "${slugs[@]}"; do
+        printf '  - %-24s %s\n' "$slug" "$(getTargetProject "$slug")" >&2
+    done
+    printf '[y/N] ' >&2
+
+    local answer=""
+    read -r answer </dev/tty 2>/dev/null || answer=n
+    case "$answer" in
+        y|Y|yes) return 0 ;;
+        *) fail $EXIT_DECLINED "aborted" ;;
+    esac
+}
+
+removeOneClone() {
+    local slug=$1 keepBranch=$2 json=$3
     local worktree target branch root
     worktree=$(getWorktreePath "$slug")
     target=$(getTargetProject "$slug")
     branch=$(getBranchName "$slug")
     root=$(getWorktreeRoot)
 
-    if [ ! -d "$worktree" ] && ! isProjectRegistered "$target"; then
-        fail $EXIT_SLUG_IN_USE "nothing to remove for slug '$slug'"
-    fi
-
-    local tip="" unmerged=0
+    local tip=""
     if git -C "$DDEV_APPROOT" rev-parse --verify "$branch" >/dev/null 2>&1; then
         tip=$(git -C "$DDEV_APPROOT" rev-parse "$branch")
-        local base
-        base=$(getBaseBranch)
-        unmerged=$(git -C "$DDEV_APPROOT" rev-list --count "$branch" --not --remotes "refs/heads/$base" 2>/dev/null) || unmerged=0
-        if [ "$unmerged" -gt 0 ] && [ "$keepBranch" != "yes" ] && [ "$forceBranch" != "yes" ]; then
-            fail $EXIT_UNMERGED_BRANCH "$branch has $unmerged commit(s) not in $base (tip $tip); pass --force-delete-branch to discard them or --keep-branch to keep the branch"
-        fi
     fi
 
-    [ "$assumeYes" = "yes" ] || confirmRemoval "$target" "$worktree"
-
-    local json
-    json=$(readConfigJson)
     [ ! -d "$worktree" ] || runHostHooks "$json" "$worktree" pre_remove
 
-    local removedProject=no removedWorktree=no removedBranch=no
+    local removedProject=no removedWorktree=no removedBranch=no removedNetwork=no
     if isProjectRegistered "$target"; then
-        ddev delete -Oy "$target" >/dev/null || fail $EXIT_DELETE "ddev delete failed for $target; nothing else was removed"
+        ddev delete -Oy "$target" >/dev/null || fail $EXIT_DELETE "ddev delete failed for $target"
         removedProject=yes
+    fi
+
+    if cloneNetworkExists "$target"; then
+        removeCloneNetwork "$target" && removedNetwork=yes
     fi
 
     if [ -d "$worktree" ]; then
@@ -716,7 +969,72 @@ commandRemove() {
         git -C "$DDEV_APPROOT" branch -D "$branch" >/dev/null && removedBranch=yes
     fi
 
-    info "removed: project=$removedProject worktree=$removedWorktree branch=$removedBranch"
+    info "removed $slug: project=$removedProject worktree=$removedWorktree branch=$removedBranch network=$removedNetwork"
+}
+
+commandRemove() {
+    local slug="" keepBranch="no" assumeYes="no" forceBranch="no" noInteractive="no" viaPicker="no"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep-branch) keepBranch=yes; shift ;;
+            --force-delete-branch) forceBranch=yes; shift ;;
+            --yes|-y) assumeYes=yes; shift ;;
+            --no-interactive) noInteractive=yes; shift ;;
+            -*) fail $EXIT_BAD_SLUG "unknown flag $1" ;;
+            *) [ -z "$slug" ] || fail $EXIT_BAD_SLUG "unexpected argument '$1'"; slug=$1; shift ;;
+        esac
+    done
+
+    local targets=()
+    if [ -n "$slug" ]; then
+        targets=("$slug")
+    else
+        [ "$noInteractive" != "yes" ] \
+            || fail $EXIT_BAD_SLUG "usage: ddev agent-env remove <slug>"
+        pickCloneInteractively
+        targets=("${pickedSlugs[@]}")
+        viaPicker=yes
+    fi
+
+    for slug in "${targets[@]}"; do
+        validateSlug "$slug"
+    done
+
+    local base worktree target branch unmerged missing="" unmergedBranches=""
+    base=$(getBaseBranch)
+    for slug in "${targets[@]}"; do
+        worktree=$(getWorktreePath "$slug")
+        target=$(getTargetProject "$slug")
+        branch=$(getBranchName "$slug")
+
+        if [ ! -d "$worktree" ] && ! isProjectRegistered "$target" && ! cloneNetworkExists "$target"; then
+            missing="$missing $slug"
+            continue
+        fi
+
+        if git -C "$DDEV_APPROOT" rev-parse --verify "$branch" >/dev/null 2>&1; then
+            unmerged=$(git -C "$DDEV_APPROOT" rev-list --count "$branch" --not --remotes "refs/heads/$base" 2>/dev/null) || unmerged=0
+            if [ "$unmerged" -gt 0 ] && [ "$keepBranch" != "yes" ] && [ "$forceBranch" != "yes" ]; then
+                unmergedBranches="$unmergedBranches $branch"
+            fi
+        fi
+    done
+
+    [ -z "$missing" ] || fail $EXIT_SLUG_IN_USE "nothing to remove for:$missing"
+    [ -z "$unmergedBranches" ] \
+        || fail $EXIT_UNMERGED_BRANCH "unmerged commits not in $base on:$unmergedBranches; pass --force-delete-branch to discard them or --keep-branch to keep the branches"
+
+    if [ "$assumeYes" != "yes" ] || [ "$viaPicker" = "yes" ]; then
+        confirmRemovals "${targets[@]}"
+    fi
+
+    local json
+    json=$(readConfigJson)
+
+    for slug in "${targets[@]}"; do
+        removeOneClone "$slug" "$keepBranch" "$json"
+    done
 }
 
 commandHelp() {
@@ -733,9 +1051,14 @@ Commands:
                    agent/<slug> branch, as DDEV project <project>-<slug>: database
                    restored from the golden snapshot, then started and smoke-tested.
   list [--stale]   List clones and their status. --stale also shows orphans (a DDEV
-                   project with no worktree, or a worktree with no DDEV project).
+                   project with no worktree, a worktree with no DDEV project, or a
+                   leftover Docker network holding an address block with no project).
   path <slug>      Print the clone's worktree path — cd into it to start working.
-  remove <slug>    Delete the clone: its DDEV project, database, worktree, and branch.
+  remove [<slug>]  Delete the clone: its DDEV project, database, worktree, branch, and
+                   leftover Docker network (so it reclaims its Docker address block).
+                   With no slug, pick one or more from an arrow-key menu of worktree-backed
+                   clones (space toggles, enter confirms; numbered-menu fallback where curses
+                   is unavailable; use 'list --stale' for orphaned projects).
   refresh-db       Retake the golden snapshot from the running source project. Run
                    after schema or seed-data changes so new clones start current.
 
@@ -748,7 +1071,8 @@ create flags:
   --force          Override the disk-space, clone-count, and DNS safety checks.
 
 remove flags:
-  --yes                  Do not prompt for confirmation.
+  --yes                  Do not prompt for confirmation (ignored when picking from the menu).
+  --no-interactive       With no slug, fail instead of showing the menu (for scripts).
   --keep-branch          Remove the clone but keep its agent/<slug> branch.
   --force-delete-branch  Delete the branch even if it has unmerged commits.
 

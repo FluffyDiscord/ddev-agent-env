@@ -167,8 +167,18 @@ bytes.
 
 ## Safety
 
+- `remove` with no slug opens an arrow-key picker of the worktree-backed clones (a `python3` curses menu,
+  space to toggle, falling back to a numbered prompt where curses is unavailable), lets you select one or
+  more, and always confirms the set before deleting; unknown slugs or branches with unmerged commits abort
+  the whole batch before anything is removed. `--no-interactive` keeps the scriptable behaviour of failing
+  when no slug is given.
 - `remove` refuses to delete a branch with unmerged commits unless `--force-delete-branch`, and prints the tip
   SHA first so the work is recoverable from the reflog.
+- `remove` reaps the clone's `ddev-<project>_default` Docker network after deleting the project, so the removed
+  clone reclaims its address block. `ddev delete` only frees that network when it runs from the project
+  directory, so an orphaned clone (worktree gone) would otherwise leave the network behind, and enough of them
+  exhaust Docker's default address pool. `list --stale` lists any such leftover networks and the `remove <slug>`
+  that reclaims each.
 - `rm -rf` is guarded to the worktrees root.
 - `create` refuses to run from inside an existing clone.
 - Provisioning is serialized with `flock`; the golden snapshot is staged under a temporary name and moved into place, so a `refresh-db` racing a `create` cannot hand out a half-written file.

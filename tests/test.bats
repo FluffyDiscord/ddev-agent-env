@@ -86,6 +86,18 @@ library() {
   [ "$status" -eq 3 ]
 }
 
+@test "remove without a slug and --no-interactive fails as before" {
+  run bash "${COMMAND}" remove --no-interactive
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"usage"* ]]
+}
+
+@test "remove without a slug reports when there are no clones to pick" {
+  run bash "${COMMAND}" remove
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"clones"* ]]
+}
+
 @test "unknown subcommand is rejected" {
   run bash "${COMMAND}" frobnicate
   [ "$status" -eq 2 ]
@@ -192,6 +204,78 @@ node_modules" ]
   copyTree "${DDEV_APPROOT}/vendor" "${TESTDIR}/clone/vendor"
   [ -f "${TESTDIR}/clone/vendor/f.txt" ]
   [ ! -e "${TESTDIR}/clone/vendor/vendor" ]
+}
+
+@test "resolveCloneSelections parses lists, dedups, and rejects bad input" {
+  library
+  run resolveCloneSelections "" 3;      [ "$status" -eq 0 ]; [ "$output" = "CANCEL" ]
+  run resolveCloneSelections "   " 3;   [ "$output" = "CANCEL" ]
+  run resolveCloneSelections abc 3;     [ "$output" = "INVALID" ]
+  run resolveCloneSelections 0 3;       [ "$output" = "INVALID" ]
+  run resolveCloneSelections 4 3;       [ "$output" = "INVALID" ]
+  run resolveCloneSelections 2 3;       [ "$output" = "2" ]
+  run resolveCloneSelections 08 8;      [ "$output" = "8" ]
+  run resolveCloneSelections "1 3" 3;   [ "$output" = "1 3" ]
+  run resolveCloneSelections "3,1,3" 3; [ "$output" = "3 1" ]
+  run resolveCloneSelections "1 5" 5;   [ "$output" = "1 5" ]
+  run resolveCloneSelections "1 6" 5;   [ "$output" = "INVALID" ]
+  run resolveCloneSelections "1 x" 5;   [ "$output" = "INVALID" ]
+}
+
+@test "the curses selector reports unavailable when given no rows" {
+  library
+  run pythonCursesSelect
+  [ "$status" -eq 4 ]
+}
+
+@test "runCursesPicker maps an unavailable curses helper to a fallback signal" {
+  library
+  run runCursesPicker
+  [ "$status" -eq 0 ]
+  [ "$output" = "UNAVAILABLE" ]
+}
+
+@test "listCloneSlugs lists worktree directories and nothing when the root is absent" {
+  library
+  run listCloneSlugs
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+
+  local root="$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")-agents"
+  mkdir -p "${root}/alpha" "${root}/beta"
+  run listCloneSlugs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"alpha"* ]]
+  [[ "$output" == *"beta"* ]]
+}
+
+@test "getCloneNetworkName maps a project to its DDEV network name" {
+  library
+  run getCloneNetworkName testproj-issue-42
+  [ "$output" = "ddev-testproj-issue-42_default" ]
+}
+
+@test "filterLeakedCloneNetworks reports only clone networks with no registered project" {
+  library
+  local prefix="ddev-testproj-"
+  local networks="ddev-testproj-alpha_default
+ddev-testproj-beta_default
+ddev-testproj_default
+ddev-otherproj-gamma_default
+bridge"
+  local registered="testproj-beta
+testproj
+otherproj-gamma"
+  run filterLeakedCloneNetworks "$networks" "$registered" "$prefix"
+  [ "$status" -eq 0 ]
+  [ "$output" = "ddev-testproj-alpha_default" ]
+}
+
+@test "filterLeakedCloneNetworks never flags the source project's own network" {
+  library
+  run filterLeakedCloneNetworks "ddev-testproj_default" "" "ddev-testproj-"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }
 
 @test "getBaseBranch prefers the override then the current branch" {
