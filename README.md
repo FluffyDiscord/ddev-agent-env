@@ -38,15 +38,45 @@ copy and says so.
 ## Install
 
 ```bash
-ddev add-on get <owner>/ddev-agent-env
+ddev add-on get FluffyDiscord/ddev-agent-env
 cp .ddev/agent-env.yaml.example .ddev/agent-env.yaml
 ```
 
-Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `flock`, `curl`, `getent` and `docker` on the host. Install checks all of them.
+Edit the copied `.ddev/agent-env.yaml` before the first `create` — the template is a placeholder, not a
+working configuration for your application.
+
+Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `flock`, `curl`, `getent` and `docker` on
+the host. Install checks all of them. `getent` and `cp --reflink` are GNU tools, so the host is expected to be
+Linux; on a host without `getent` the install check fails, and without reflink support the copies fall back to
+full copies.
 
 > **The command installs globally** (`~/.config/ddev/commands/host/agent-env`), so it works in every project.
 > DDEV does not reference-count global files: `ddev add-on remove agent-env` in *any* project deletes it for
 > *all* of them. Install adds `.ddev/addon-metadata/` to your `.gitignore` so a clone cannot uninstall it.
+
+## Commands
+
+`ddev agent-env --help` prints the same reference.
+
+| | |
+|---|---|
+| `create <slug>` | Clone into `../<project>-agents/<slug>` on a new `agent/<slug>` branch, as DDEV project `<project>-<slug>`; restore the golden snapshot, start, smoke-test |
+| `list [--stale]` | List clones and their status; `--stale` also shows orphans — a DDEV project with no worktree, a worktree with no DDEV project, a leftover Docker network |
+| `path <slug>` | Print the clone's worktree path |
+| `remove [<slug>]` | Delete the clone: DDEV project, database, worktree, branch, leftover network. With no slug, pick from a menu |
+| `refresh-db` | Retake the golden snapshot from the running source project. Run it after schema or seed-data changes so new clones start current |
+
+`create` flags: `--from <ref>` branches from `<ref>` instead of `HEAD`; `--fresh` skips the snapshot restore and
+starts with an empty database; `--fresh-deps` reinstalls the `derived` paths instead of copying them;
+`--with-secrets` keeps real values instead of redacting `env_redact` keys; `--no-start` builds the worktree
+without starting DDEV; `--force` overrides the disk-space, clone-count and DNS checks.
+
+`remove` flags: `--yes` skips the confirmation; `--no-interactive` fails instead of opening the menu when no slug
+is given; `--keep-branch` keeps `agent/<slug>`; `--force-delete-branch` deletes it even with unmerged commits.
+
+Environment knobs, all optional: `AGENT_ENV_BASE_BRANCH` (branch the unmerged-commit check compares against —
+default: the source project's current branch), `AGENT_ENV_MAX_CLONES`, `AGENT_ENV_WARN_CLONES`,
+`AGENT_ENV_DISK_FLOOR_GB`, `AGENT_ENV_DOCKER_FLOOR_GB`, `AGENT_ENV_LOCK_TIMEOUT`, `AGENT_ENV_SELECT_TIMEOUT`.
 
 ## Configuration
 
@@ -54,17 +84,22 @@ Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `flock`, 
 `--fresh-deps` replaces only the first:
 
 - **`derived`** — regenerable by `composer install` / `npm ci` / a build (`vendor`, `node_modules`, `public/build`)
-- **`materialized`** — nothing regenerates these (`config/jwt`, `public/media`, fixture data)
+- **`materialized`** — nothing regenerates these (`config/jwt/private.pem`, `public/media`, fixture data)
 
 `env_rewrite_paths` files are copied with the source hostname replaced by the clone's, so a
 `MAILER_WEB_URL="https://myproject.ddev.site:8026"` does not point every agent at the main project's mailbox.
 `env_redact` blanks named keys (`REDACTED-IN-CLONE`) unless you pass `--with-secrets` — every clone otherwise
 carries a live copy of your credentials.
 
+`migrations_path` (default `migrations`) names the directory whose filenames are recorded alongside the golden
+snapshot. `create` compares that record against the new worktree and warns when the two have drifted — a clone
+whose database is ahead of its code makes `doctrine:migrations:diff` invent duplicates, and one whose code is
+ahead needs its migration command run before the schema can be trusted. Point it at your migrations directory,
+or ignore it if the project has none.
+
 ### A worked example
 
-A fuller `.ddev/agent-env.yaml` for a typical PHP application. It shows two things the minimal template
-does not:
+A fuller `.ddev/agent-env.yaml` for a typical PHP application, and the two rules behind it:
 
 ```yaml
 copy_paths:
@@ -81,6 +116,8 @@ copy_paths:
 
 env_rewrite_paths:
   - .env.local
+
+migrations_path: migrations
 
 env_redact:           # blanked to REDACTED-IN-CLONE unless you pass --with-secrets
   - PAYMENT_GATEWAY_SECRET
@@ -191,10 +228,10 @@ DDEV project on the machine. Nothing here can stop that — deny them in your ag
 
 | | | | |
 |---|---|---|---|
-| 1 not in a DDEV project | 2 bad slug | 3 slug in use | 4 disk or clone cap |
+| 1 not in a DDEV project | 2 bad slug or usage | 3 slug in use | 4 disk or clone cap |
 | 5 unsafe `rm -rf` path | 6 no golden snapshot | 7 `git worktree add` | 8 snapshot copy |
 | 9 `ddev start` | 10 `ddev snapshot restore` | 11 restore hook | 12 host hook |
-| 13 verification | 14 host tooling | 15 DNS | 16 write |
+| 13 verification | 14 host tooling or unreadable `agent-env.yaml` | 15 DNS | 16 write |
 | 17 copy | 18 `refresh-db` | 19 `ddev delete` | 20 lock timeout |
 | 21 run from inside a clone | 22 unmerged branch | 23 confirmation declined | 24 unhandled failure |
 

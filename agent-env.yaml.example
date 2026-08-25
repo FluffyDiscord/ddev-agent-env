@@ -11,14 +11,22 @@ copy_paths:
     - node_modules
     - public/build
 
+  # Nothing regenerates these. List files individually when the directory also
+  # holds tracked files — the worktree checks those out first, and copying the
+  # directory onto an existing one nests it (config/jwt/jwt/private.pem).
   materialized:
-    - config/jwt
+    - config/jwt/private.pem
+    - config/jwt/public.pem
     - public/media
 
 env_rewrite_paths:
   - .env.local
 
 env_redact: []
+
+# Filenames here are recorded with the golden snapshot; create warns when a
+# clone's database and its code have drifted apart.
+migrations_path: migrations
 
 hooks:
   post_worktree: []
