@@ -54,6 +54,7 @@ rollbackArmed=no
 rollbackWorktree=""
 rollbackBranch=""
 pickedSlugs=()
+portableLockDir=""
 
 runRollback() {
     [ "$rollbackArmed" = "yes" ] || return 0
@@ -64,6 +65,12 @@ runRollback() {
     [ -z "$rollbackBranch" ] || git -C "$DDEV_APPROOT" branch -D "$rollbackBranch" >/dev/null 2>&1 || true
 }
 
+releasePortableLock() {
+    [ -n "$portableLockDir" ] || return 0
+    rm -rf "$portableLockDir" 2>/dev/null || true
+    portableLockDir=""
+}
+
 onUnhandledError() {
     local status=$1 line=$2
     runRollback
@@ -72,7 +79,7 @@ onUnhandledError() {
 }
 
 trap 'onUnhandledError $? $LINENO' ERR
-trap runRollback EXIT
+trap 'runRollback; releasePortableLock' EXIT
 
 requireDdevContext() {
     [ -n "${DDEV_APPROOT:-}" ] || fail $EXIT_NOT_DDEV "run this from inside a DDEV project directory"
@@ -160,8 +167,18 @@ elif data is not None:
 
 getFreeGb() {
     local avail
-    avail=$(df --output=avail -BG "$1" 2>/dev/null | tail -1 | tr -dc '0-9') || avail=""
+    avail=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int(($4 + 1024 * 1024 - 1) / (1024 * 1024))}') || avail=""
     echo "${avail:-0}"
+}
+
+resolvesHost() {
+    python3 -c '
+import socket, sys
+try:
+    socket.getaddrinfo(sys.argv[1], None)
+except OSError:
+    sys.exit(1)
+' "$1"
 }
 
 listProjectsJson() { ddev list -j 2>/dev/null || echo '{"raw":[]}'; }
@@ -296,9 +313,14 @@ copyTree() {
     if cp --reflink=always -a "$source" "$target" 2>/dev/null; then
         return 0
     fi
-
     rm -rf "$target"
-    warn "reflink unavailable for $source; falling back to a full copy (this costs real disk)"
+
+    if cp -c -a "$source" "$target" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$target"
+
+    warn "copy-on-write unavailable for $source; falling back to a full copy (this costs real disk)"
     cp -a "$source" "$target" || fail $EXIT_COPY "could not copy $source"
 }
 
@@ -365,12 +387,22 @@ shutil.copymode(source, target)
     done <<<"$paths"
 }
 
+stripDdevGeneratedFirstLine() {
+    local file=$1 tmp
+    tmp="$file.tmp.$$"
+    if ! awk 'NR==1 && /#ddev-generated/ {next} {print}' "$file" >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$file"
+}
+
 writeCloneConfig() {
     local worktree=$1 target=$2
 
     if [ -f "$DDEV_APPROOT/.ddev/.gitignore" ]; then
         cp -a "$DDEV_APPROOT/.ddev/.gitignore" "$worktree/.ddev/.gitignore"
-        sed -i '1{/#ddev-generated/d}' "$worktree/.ddev/.gitignore"
+        stripDdevGeneratedFirstLine "$worktree/.ddev/.gitignore"
     fi
 
     cat >"$worktree/.ddev/config.local.yaml" <<YAML || fail $EXIT_WRITE "cannot write config.local.yaml"
@@ -515,15 +547,19 @@ commandCreate() {
     local worktreeFree dockerRoot dockerFree floor dockerFloor
     worktreeFree=$(getFreeGb "$(getWorktreeRoot)")
     dockerRoot=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || dockerRoot=/var/lib/docker
-    dockerFree=$(getFreeGb "$dockerRoot")
     floor=$(getWorktreeDiskFloorGb)
     dockerFloor=$(getDockerDiskFloorGb)
 
     if [ "$force" != "yes" ]; then
         [ "$worktreeFree" -ge "$floor" ] \
             || fail $EXIT_CAPACITY "only ${worktreeFree}GB free on $(getWorktreeRoot); the floor is ${floor}GB (override with --force)"
-        [ "$dockerFree" -ge "$dockerFloor" ] \
-            || fail $EXIT_CAPACITY "only ${dockerFree}GB free on $dockerRoot; the floor is ${dockerFloor}GB (override with --force)"
+        if [ -d "$dockerRoot" ]; then
+            dockerFree=$(getFreeGb "$dockerRoot")
+            [ "$dockerFree" -ge "$dockerFloor" ] \
+                || fail $EXIT_CAPACITY "only ${dockerFree}GB free on $dockerRoot; the floor is ${dockerFloor}GB (override with --force)"
+        else
+            warn "cannot measure the Docker disk at $dockerRoot from the host (VM-based engine such as OrbStack, Docker Desktop, or Colima); skipping the Docker free-space check"
+        fi
     fi
 
     local json running maxClones warnAt migrationsPath
@@ -538,7 +574,7 @@ commandCreate() {
     fi
     [ "$running" -lt "$warnAt" ] || warn "$running clones already running; each web+db pair costs roughly 1-2GB of RAM"
 
-    if ! getent hosts "$target.${DDEV_TLD:-ddev.site}" >/dev/null 2>&1 && [ "$force" != "yes" ]; then
+    if ! resolvesHost "$target.${DDEV_TLD:-ddev.site}" && [ "$force" != "yes" ]; then
         fail $EXIT_DNS "$target.${DDEV_TLD:-ddev.site} does not resolve; ddev would fall back to editing /etc/hosts, which needs sudo (override with --force)"
     fi
 
@@ -1090,12 +1126,43 @@ Base branch for the unmerged-commit check: $AGENT_ENV_BASE_BRANCH
 HELP
 }
 
+acquireLockPortable() {
+    local lockFile=$1
+    local lockDir="$lockFile.d"
+    local timeout waited holderPid staleDir
+    timeout=$(getLockTimeoutSeconds)
+    waited=0
+    while ! mkdir "$lockDir" 2>/dev/null; do
+        holderPid=$(cat "$lockDir/pid" 2>/dev/null || echo "")
+        if [ -n "$holderPid" ] && ! kill -0 "$holderPid" 2>/dev/null; then
+            staleDir="$lockDir.stale.$$"
+            if mv "$lockDir" "$staleDir" 2>/dev/null; then
+                rm -rf "$staleDir" 2>/dev/null || true
+            fi
+            continue
+        fi
+        [ "$waited" -lt "$timeout" ] \
+            || fail $EXIT_LOCKED "another agent-env run holds the lock on $lockDir"
+        sleep 1
+        waited=$((waited + 1))
+    done
+    printf '%s\n' "$$" >"$lockDir/pid" \
+        || fail $EXIT_LOCKED "could not write the lock owner file in $lockDir"
+    portableLockDir="$lockDir"
+}
+
 withLock() {
     local lockFile="$DDEV_APPROOT/.ddev/db_snapshots/.agent-env.lock"
     mkdir -p "$(dirname "$lockFile")"
-    exec 9>"$lockFile"
-    flock -w "$(getLockTimeoutSeconds)" 9 \
-        || fail $EXIT_LOCKED "another agent-env run holds the lock on $lockFile"
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$lockFile"
+        flock -w "$(getLockTimeoutSeconds)" 9 \
+            || fail $EXIT_LOCKED "another agent-env run holds the lock on $lockFile"
+        return 0
+    fi
+
+    acquireLockPortable "$lockFile"
 }
 
 main() {

@@ -45,10 +45,11 @@ cp .ddev/agent-env.yaml.example .ddev/agent-env.yaml
 Edit the copied `.ddev/agent-env.yaml` before the first `create` — the template is a placeholder, not a
 working configuration for your application.
 
-Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `flock`, `curl`, `getent` and `docker` on
-the host. Install checks all of them. `getent` and `cp --reflink` are GNU tools, so the host is expected to be
-Linux; on a host without `getent` the install check fails, and without reflink support the copies fall back to
-full copies.
+Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `curl` and `docker` on the host. Install
+checks those. Works on Linux and macOS. On Linux it uses `flock` for locking and `getent`/`cp --reflink` where
+available; on macOS (or any host without them) it falls back automatically — a `mkdir`-based lock, `python3`
+socket resolution instead of `getent`, and APFS `cp -c` clonefiles (or, failing copy-on-write entirely, full
+copies).
 
 > **The command installs globally** (`~/.config/ddev/commands/host/agent-env`), so it works in every project.
 > DDEV does not reference-count global files: `ddev add-on remove agent-env` in *any* project deletes it for
@@ -218,7 +219,7 @@ bytes.
   that reclaims each.
 - `rm -rf` is guarded to the worktrees root.
 - `create` refuses to run from inside an existing clone.
-- Provisioning is serialized with `flock`; the golden snapshot is staged under a temporary name and moved into place, so a `refresh-db` racing a `create` cannot hand out a half-written file.
+- Provisioning is serialized with `flock` (or a `mkdir`-based lock where `flock` is absent, e.g. macOS); the golden snapshot is staged under a temporary name and moved into place, so a `refresh-db` racing a `create` cannot hand out a half-written file.
 - Every failure mode has its own exit code, so an orchestrator can branch without parsing text. An unhandled failure exits 24 rather than masquerading as one of them.
 
 `ddev poweroff` and `ddev delete --all` are global and will destroy your main project along with every other
