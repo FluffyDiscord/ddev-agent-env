@@ -28,6 +28,16 @@ env_redact: []
 # clone's database and its code have drifted apart.
 migrations_path: migrations
 
+# The last step of create: request this path on the clone's URL and require this
+# status. An API-only backend serves nothing at /, so point it at a route that
+# answers — a 401 from an authenticated endpoint already proves PHP, routing and
+# the restored database are alive:
+#   smoke_path: /api/v1/widget/config
+#   smoke_status: 401
+# smoke_status also takes a list ([200, 302]) when more than one answer is fine.
+smoke_path: /
+smoke_status: 200
+
 hooks:
   post_worktree: []
   pre_remove: []

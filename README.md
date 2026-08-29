@@ -72,8 +72,9 @@ starts with an empty database; `--fresh-deps` reinstalls the `derived` paths ins
 `--with-secrets` keeps real values instead of redacting `env_redact` keys; `--no-start` builds the worktree
 without starting DDEV; `--force` overrides the disk-space, clone-count and DNS checks.
 
-`remove` flags: `--yes` skips the confirmation; `--no-interactive` fails instead of opening the menu when no slug
-is given; `--keep-branch` keeps `agent/<slug>`; `--force-delete-branch` deletes it even with unmerged commits.
+`remove` flags: `--yes` (or `-y`) skips the confirmation, so `remove <slug> --yes` runs unattended;
+`--no-interactive` fails instead of opening the menu when no slug is given; `--keep-branch` keeps
+`agent/<slug>`; `--force-delete-branch` deletes it even with unmerged commits.
 
 Environment knobs, all optional: `AGENT_ENV_BASE_BRANCH` (branch the unmerged-commit check compares against —
 default: the source project's current branch), `AGENT_ENV_MAX_CLONES`, `AGENT_ENV_WARN_CLONES`,
@@ -98,6 +99,24 @@ whose database is ahead of its code makes `doctrine:migrations:diff` invent dupl
 ahead needs its migration command run before the schema can be trusted. Point it at your migrations directory,
 or ignore it if the project has none.
 
+`smoke_path` (default `/`) and `smoke_status` (default `200`) are the last step of `create`: it requests that
+path on the clone's primary URL and requires that status. The defaults suit an application that serves a page at
+`/`. An API-only backend does not — its `/` is a 404 in the source project too — so point the check at a route
+that answers. A `401` from an authenticated endpoint is a perfectly good smoke test: it proves PHP, routing and
+the restored database are all alive.
+
+```yaml
+smoke_path: /api/v1/widget/config
+smoke_status: 401
+```
+
+`smoke_status` also takes a list — `smoke_status: [200, 302]` — when more than one answer is acceptable; a bare
+number stays valid. `smoke_path` joins with or without a leading slash. A non-numeric `smoke_status`, or a
+`smoke_path` that is a URL rather than a path, fails at the *start* of `create` (exit 14), not after the clone
+is built. When the status simply is not the expected one, the failure names the URL requested and the status
+expected; the "restored data still points at the source project's hostname" hint is kept for the cases where it
+is actually the likely cause — a 5xx, or a redirect to the source project's hostname.
+
 ### A worked example
 
 A fuller `.ddev/agent-env.yaml` for a typical PHP application, and the two rules behind it:
@@ -119,6 +138,9 @@ env_rewrite_paths:
   - .env.local
 
 migrations_path: migrations
+
+smoke_path: /api/v1/widget/config   # this backend serves no page at /
+smoke_status: 401                   # unauthenticated, but PHP + routing + DB are alive
 
 env_redact:           # blanked to REDACTED-IN-CLONE unless you pass --with-secrets
   - PAYMENT_GATEWAY_SECRET
@@ -232,7 +254,7 @@ DDEV project on the machine. Nothing here can stop that — deny them in your ag
 | 1 not in a DDEV project | 2 bad slug or usage | 3 slug in use | 4 disk or clone cap |
 | 5 unsafe `rm -rf` path | 6 no golden snapshot | 7 `git worktree add` | 8 snapshot copy |
 | 9 `ddev start` | 10 `ddev snapshot restore` | 11 restore hook | 12 host hook |
-| 13 verification | 14 host tooling or unreadable `agent-env.yaml` | 15 DNS | 16 write |
+| 13 verification | 14 host tooling, or `agent-env.yaml` unreadable or invalid | 15 DNS | 16 write |
 | 17 copy | 18 `refresh-db` | 19 `ddev delete` | 20 lock timeout |
 | 21 run from inside a clone | 22 unmerged branch | 23 confirmation declined | 24 unhandled failure |
 

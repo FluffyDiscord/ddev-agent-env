@@ -45,6 +45,8 @@ getSelectionTimeoutSeconds() {
 getGoldenSnapshotName() { echo "agent-golden"; }
 getDnsLabelLimit() { echo 63; }
 getMinimumGitVersion() { echo "2.31"; }
+getDefaultSmokePath() { echo "/"; }
+getDefaultSmokeStatus() { echo "200"; }
 
 fail() { local code=$1; shift; printf '%s\n' "agent-env: $*" >&2; exit "$code"; }
 warn() { printf '%s\n' "agent-env: $*" >&2; }
@@ -127,6 +129,7 @@ getTargetProject() { echo "$DDEV_PROJECT-$1"; }
 getBranchName() { echo "agent/$1"; }
 getCloneNetworkName() { echo "ddev-$1_default"; }
 getSnapshotDir() { echo "$DDEV_APPROOT/.ddev/db_snapshots"; }
+getSourceHost() { echo "${DDEV_HOSTNAME:-$DDEV_PROJECT.${DDEV_TLD:-ddev.site}}"; }
 
 getBaseBranch() {
     if [ -n "${AGENT_ENV_BASE_BRANCH:-}" ]; then
@@ -472,6 +475,65 @@ getPrimaryUrl() {
     echo "$url"
 }
 
+getSmokePath() {
+    local json=$1 path
+    path=$(queryConfig "$json" "smoke_path")
+    echo "${path:-$(getDefaultSmokePath)}"
+}
+
+getSmokeStatuses() {
+    local json=$1 statuses
+    statuses=$(queryConfig "$json" "smoke_status" | paste -sd' ' -)
+    echo "${statuses:-$(getDefaultSmokeStatus)}"
+}
+
+validateSmokeConfig() {
+    local json=$1 path status
+    path=$(getSmokePath "$json")
+    case "$path" in
+        *://*|*[[:space:]]*)
+            fail $EXIT_YAML "smoke_path '$path' is not a path; give a path such as /api/v1/health, not a URL"
+            ;;
+    esac
+
+    for status in $(getSmokeStatuses "$json"); do
+        [[ "$status" =~ ^[0-9]{3}$ ]] \
+            || fail $EXIT_YAML "smoke_status '$status' is not a three-digit HTTP status code"
+    done
+}
+
+joinSmokeUrl() {
+    local url=$1 path=$2
+    echo "${url%/}/${path#/}"
+}
+
+matchesSmokeStatus() {
+    local status=$1 expected=$2 candidate
+    for candidate in $expected; do
+        if [ "$status" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+describeSmokeHint() {
+    local status=$1 redirect=$2 sourceHost
+    sourceHost=$(getSourceHost)
+
+    case "$redirect" in
+        *"//$sourceHost"*)
+            echo " — it redirects to the source project's hostname, so restored data still carries it (see post-restore-snapshot hooks)"
+            return 0
+            ;;
+    esac
+
+    case "$status" in
+        5*) echo " — a 5xx is usually restored data still pointing at the source project's hostname (see post-restore-snapshot hooks)" ;;
+        *) echo " — set smoke_path and smoke_status in .ddev/agent-env.yaml if this is not the right smoke test for this project" ;;
+    esac
+}
+
 verifyClone() {
     local worktree=$1 started=$2 restored=$3 json=$4 fresh=$5 noStart=$6
     local skipped=""
@@ -495,12 +557,18 @@ verifyClone() {
     [ -z "$missing" ] || fail $EXIT_VERIFY "declared paths are missing from the clone:$missing"
 
     if [ "$started" = "yes" ] && [ "$restored" = "yes" ]; then
-        local url status
+        local url smokeUrl expected response status redirect
         url=$(getPrimaryUrl "$worktree")
         [ -n "$url" ] || fail $EXIT_VERIFY "could not read the clone's primary URL from ddev describe"
-        status=$(curl -sk -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || status=000
-        [ "$status" = "200" ] \
-            || fail $EXIT_VERIFY "$url returned $status; the clone is not ready (restored data still pointing at the source project's hostname is the usual cause — see post-restore-snapshot hooks)"
+
+        smokeUrl=$(joinSmokeUrl "$url" "$(getSmokePath "$json")")
+        expected=$(getSmokeStatuses "$json")
+        response=$(curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' "$smokeUrl" 2>/dev/null) || response="000 "
+        status=${response%% *}
+        redirect=${response#* }
+
+        matchesSmokeStatus "$status" "$expected" \
+            || fail $EXIT_VERIFY "$smokeUrl returned $status, expected ${expected// /, }$(describeSmokeHint "$status" "$redirect")"
     fi
 
     [ "$noStart" != "yes" ] || skipped="$skipped --no-start"
@@ -564,6 +632,7 @@ commandCreate() {
 
     local json running maxClones warnAt migrationsPath
     json=$(readConfigJson)
+    validateSmokeConfig "$json"
     running=$(getRunningCloneCount)
     maxClones=$(queryConfig "$json" "max_clones"); maxClones=${maxClones:-$(getDefaultMaxClones)}
     warnAt=$(getCloneWarnThreshold)
@@ -606,7 +675,7 @@ commandCreate() {
     writeCloneConfig "$worktree" "$target"
 
     local sourceHost cloneHost
-    sourceHost="${DDEV_HOSTNAME:-$DDEV_PROJECT.${DDEV_TLD:-ddev.site}}"
+    sourceHost=$(getSourceHost)
     cloneHost="$target.${DDEV_TLD:-ddev.site}"
 
     [ "$freshDeps" = "yes" ] || copyDeclaredPaths "$json" "$worktree" derived
@@ -746,7 +815,7 @@ confirmRemoval() {
     local target=$1 worktree=$2
     printf 'Remove clone %s, its database, and %s? [y/N] ' "$target" "$worktree"
     local answer=""
-    read -r answer </dev/tty 2>/dev/null || answer=n
+    read -r answer 2>/dev/null </dev/tty || answer=n
     case "$answer" in
         y|Y|yes) return 0 ;;
         *) fail $EXIT_DECLINED "aborted" ;;
@@ -895,7 +964,7 @@ runNumberedPicker() {
     printf 'Select clones to remove [1-%d, space/comma separated], or Enter to cancel: ' "${#rows[@]}" >&2
 
     local answer=""
-    read -r -t "$(getSelectionTimeoutSeconds)" answer </dev/tty 2>/dev/null || answer=""
+    read -r -t "$(getSelectionTimeoutSeconds)" answer 2>/dev/null </dev/tty || answer=""
     resolveCloneSelections "$answer" "${#rows[@]}"
 }
 
@@ -909,7 +978,7 @@ pickCloneInteractively() {
     [ "${#slugs[@]}" -gt 0 ] \
         || fail $EXIT_SLUG_IN_USE "no worktree-backed clones to remove (see 'ddev agent-env list --stale' for orphaned projects)"
 
-    : </dev/tty 2>/dev/null \
+    : 2>/dev/null </dev/tty \
         || fail $EXIT_BAD_SLUG "no terminal for interactive selection; pass a slug or use --no-interactive"
 
     local rows=() branch
@@ -955,7 +1024,7 @@ confirmRemovals() {
     printf '[y/N] ' >&2
 
     local answer=""
-    read -r answer </dev/tty 2>/dev/null || answer=n
+    read -r answer 2>/dev/null </dev/tty || answer=n
     case "$answer" in
         y|Y|yes) return 0 ;;
         *) fail $EXIT_DECLINED "aborted" ;;
@@ -1107,7 +1176,7 @@ create flags:
   --force          Override the disk-space, clone-count, and DNS safety checks.
 
 remove flags:
-  --yes                  Do not prompt for confirmation (ignored when picking from the menu).
+  --yes, -y              Do not prompt for confirmation (ignored when picking from the menu).
   --no-interactive       With no slug, fail instead of showing the menu (for scripts).
   --keep-branch          Remove the clone but keep its agent/<slug> branch.
   --force-delete-branch  Delete the branch even if it has unmerged commits.
@@ -1118,8 +1187,9 @@ Typical flow:
   ddev agent-env remove issue-42
 
 What gets cloned is declared in .ddev/agent-env.yaml (deps and files to copy, env
-values to rewrite or redact). Container-side setup (DB fixups, reindexing) goes in
-.ddev/config.*.yaml hooks, not there.
+values to rewrite or redact, and the smoke_path / smoke_status create checks the
+started clone with — default GET / expecting 200). Container-side setup (DB fixups,
+reindexing) goes in .ddev/config.*.yaml hooks, not there.
 
 Base branch for the unmerged-commit check: $AGENT_ENV_BASE_BRANCH
 (default: the source project's current branch).

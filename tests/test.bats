@@ -98,6 +98,15 @@ library() {
   [[ "$output" == *"clones"* ]]
 }
 
+@test "remove --yes needs no terminal" {
+  local root="$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")-agents"
+  mkdir -p "${root}/alpha"
+  run bash "${COMMAND}" remove alpha --yes </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"removed alpha"* ]]
+  [ ! -d "${root}/alpha" ]
+}
+
 @test "unknown subcommand is rejected" {
   run bash "${COMMAND}" frobnicate
   [ "$status" -eq 2 ]
@@ -143,6 +152,78 @@ node_modules" ]
   run queryConfig "$json" "hooks.post_worktree"
   [ "$status" -eq 0 ]
   [[ "$output" == *"it's fine"* ]]
+}
+
+@test "the smoke test falls back to / and 200 when the keys are absent" {
+  library
+  run getSmokePath '{}';                        [ "$output" = "/" ]
+  run getSmokeStatuses '{}';                    [ "$output" = "200" ]
+  run getSmokePath '{"max_clones": 3}';         [ "$output" = "/" ]
+  run getSmokeStatuses '{"max_clones": 3}';     [ "$output" = "200" ]
+  run validateSmokeConfig '{}';                 [ "$status" -eq 0 ]
+  run joinSmokeUrl https://testproj-alpha.ddev.site "$(getSmokePath '{}')"
+  [ "$output" = "https://testproj-alpha.ddev.site/" ]
+  run matchesSmokeStatus 200 200;               [ "$status" -eq 0 ]
+  run matchesSmokeStatus 404 200;               [ "$status" -eq 1 ]
+}
+
+@test "smoke_path and smoke_status override the defaults" {
+  library
+  local json='{"smoke_path": "/api/v1/widget/config", "smoke_status": 401}'
+  run validateSmokeConfig "$json"; [ "$status" -eq 0 ]
+  run getSmokePath "$json";        [ "$output" = "/api/v1/widget/config" ]
+  run getSmokeStatuses "$json";    [ "$output" = "401" ]
+  run matchesSmokeStatus 401 401;  [ "$status" -eq 0 ]
+  run matchesSmokeStatus 200 401;  [ "$status" -eq 1 ]
+}
+
+@test "smoke_status takes a list as well as a bare number" {
+  library
+  run validateSmokeConfig '{"smoke_status": [200, 302]}'; [ "$status" -eq 0 ]
+  run getSmokeStatuses '{"smoke_status": [200, 302]}';    [ "$output" = "200 302" ]
+  run matchesSmokeStatus 302 "200 302";                   [ "$status" -eq 0 ]
+  run matchesSmokeStatus 404 "200 302";                   [ "$status" -eq 1 ]
+}
+
+@test "the smoke path joins whatever the slashes" {
+  library
+  run joinSmokeUrl https://c.ddev.site /api/v1;  [ "$output" = "https://c.ddev.site/api/v1" ]
+  run joinSmokeUrl https://c.ddev.site api/v1;   [ "$output" = "https://c.ddev.site/api/v1" ]
+  run joinSmokeUrl https://c.ddev.site/ /api/v1; [ "$output" = "https://c.ddev.site/api/v1" ]
+  run joinSmokeUrl https://c.ddev.site/ api/v1;  [ "$output" = "https://c.ddev.site/api/v1" ]
+}
+
+@test "a non-numeric smoke_status is rejected by name" {
+  library
+  run validateSmokeConfig '{"smoke_status": "okay"}'
+  [ "$status" -eq 14 ]
+  [[ "$output" == *"smoke_status"* ]]
+  run validateSmokeConfig '{"smoke_status": [200, "nope"]}'
+  [ "$status" -eq 14 ]
+  [[ "$output" == *"smoke_status"* ]]
+}
+
+@test "a smoke_path that is not a path is rejected by name" {
+  library
+  run validateSmokeConfig '{"smoke_path": "https://elsewhere.example/health"}'
+  [ "$status" -eq 14 ]
+  [[ "$output" == *"smoke_path"* ]]
+  run validateSmokeConfig '{"smoke_path": "/api health"}'
+  [ "$status" -eq 14 ]
+  [[ "$output" == *"smoke_path"* ]]
+}
+
+@test "the smoke hint blames the hostname only when that is plausible" {
+  library
+  run describeSmokeHint 404 ""
+  [[ "$output" == *"smoke_path"* ]]
+  [[ "$output" != *"hostname"* ]]
+  run describeSmokeHint 500 ""
+  [[ "$output" == *"hostname"* ]]
+  run describeSmokeHint 302 "https://testproj.ddev.site/login"
+  [[ "$output" == *"hostname"* ]]
+  run describeSmokeHint 302 "https://testproj-alpha.ddev.site/login"
+  [[ "$output" != *"hostname"* ]]
 }
 
 @test "getFreeGb returns 0 for a path that does not exist" {
