@@ -400,6 +400,73 @@ stripDdevGeneratedFirstLine() {
     mv -f "$tmp" "$file"
 }
 
+# DDEV appends additional_hostnames across config files rather than replacing them, so a rebased
+# list in config.local.yaml cannot take the parent's names back off the clone. The tracked list has
+# to go; the file stays checked out, so the index entry is marked skip-worktree (per-worktree) to
+# keep the clone's branch clean.
+clearTrackedHostnames() {
+    local worktree=$1
+    local config="$worktree/.ddev/config.yaml"
+
+    [ -f "$config" ] || return 0
+
+    grep -q '^additional_hostnames:' "$config" || return 0
+
+    python3 -c '
+import re, sys
+
+path = sys.argv[1]
+text = open(path).read()
+stripped = re.sub(r"^additional_hostnames:\n(?:[ \t]+.*\n|[ \t]*#.*\n)*", "additional_hostnames: []\n", text, count=1, flags=re.M)
+open(path, "w").write(stripped)
+' "$config" || fail $EXIT_WRITE "cannot clear additional_hostnames in the clone's config.yaml"
+
+    git -C "$worktree" update-index --skip-worktree .ddev/config.yaml 2>/dev/null || true
+}
+
+# additional_hostnames are project-wide names in the router, not per-project ones: a clone that
+# inherited the parent's list would claim the parent's URLs, and whichever container the router
+# picked would answer them. Each name is rebased onto the clone — a name starting with the parent
+# project's gets that prefix swapped, anything else is prefixed — so the clone's aliases mirror
+# the parent's without colliding. Emits nothing when the parent declares none.
+rebasedHostnames() {
+    local target=$1 config
+
+    for config in "$DDEV_APPROOT/.ddev/config.yaml" "$DDEV_APPROOT"/.ddev/config.*.yaml; do
+        [ -f "$config" ] && printf '%s\n' "$config"
+    done | python3 -c '
+import sys, yaml
+
+target = sys.argv[1]
+parent = ""
+hostnames = []
+
+for path in sys.stdin.read().split():
+    try:
+        document = yaml.safe_load(open(path)) or {}
+    except Exception:
+        continue
+    if isinstance(document.get("name"), str):
+        parent = document["name"]
+    if isinstance(document.get("additional_hostnames"), list):
+        hostnames = [str(name) for name in document["additional_hostnames"]]
+
+if not hostnames:
+    sys.exit(0)
+
+rebased = []
+for name in hostnames:
+    if parent and name == parent:
+        rebased.append(target)
+    elif parent and name.startswith(parent + "-"):
+        rebased.append(target + name[len(parent):])
+    else:
+        rebased.append(target + "-" + name)
+
+print(yaml.safe_dump({"additional_hostnames": rebased}, default_flow_style=False).strip())
+' "$target"
+}
+
 writeCloneConfig() {
     local worktree=$1 target=$2
 
@@ -408,10 +475,12 @@ writeCloneConfig() {
         stripDdevGeneratedFirstLine "$worktree/.ddev/.gitignore"
     fi
 
-    cat >"$worktree/.ddev/config.local.yaml" <<YAML || fail $EXIT_WRITE "cannot write config.local.yaml"
-name: $target
-fail_on_hook_fail: true
-YAML
+    {
+        printf 'name: %s\nfail_on_hook_fail: true\n' "$target"
+        rebasedHostnames "$target"
+    } >"$worktree/.ddev/config.local.yaml" || fail $EXIT_WRITE "cannot write config.local.yaml"
+
+    clearTrackedHostnames "$worktree"
 
     cat >"$worktree/.ddev/docker-compose.agentgit.yaml" <<YAML || fail $EXIT_WRITE "cannot write docker-compose.agentgit.yaml"
 services:
