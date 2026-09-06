@@ -1,7 +1,6 @@
 # ddev-agent-env
 
-Give every AI coding agent its own git worktree **and** its own DDEV project, cloned from your running one, so
-several agents can build and test in parallel without breaking each other or your main instance.
+One git worktree **and** one DDEV project per AI coding agent, cloned from your running project. Agents build and test in parallel, isolated from each other and from your main instance.
 
 ```bash
 ddev agent-env create issue-42
@@ -14,26 +13,18 @@ ddev agent-env list
 ddev agent-env remove issue-42
 ```
 
-## Why this exists
-
-`ddev clone` [does not exist yet](https://github.com/ddev/ddev/issues/8187). Doing it by hand — worktree,
-rename, export/import the database, re-install dependencies — is slow and, on a real application, produces a
-clone that does not work. This packages the parts that actually matter.
+`ddev clone` [does not exist yet](https://github.com/ddev/ddev/issues/8187); by hand it produces a clone that does not work.
 
 ## What a clone gets
 
 | | How |
 |---|---|
-| Code | `git worktree add`, on a fresh `agent/<slug>` branch |
-| Project identity | `name:` in `.ddev/config.local.yaml`, which DDEV already git-ignores — your tracked `config.yaml` is untouched |
-| Database | a reusable golden `ddev snapshot`, restored into the clone |
-| Dependencies, media, build artifacts | `cp --reflink` from the source — near-instant and near-zero disk on a copy-on-write filesystem |
-| Extra services | automatically — DDEV namespaces containers and volumes by project name |
-| Working `git` inside the containers | a generated compose file bind-mounting the main repo's `.git` at its host path |
-
-On a copy-on-write filesystem the dependency, media and build copies are reflinked: a multi-gigabyte set copies
-in seconds and adds no real disk until a file is modified. Without reflink support the tool falls back to a full
-copy and says so.
+| Code | `git worktree add`, fresh `agent/<slug>` branch |
+| Project identity | `name:` in `.ddev/config.local.yaml` (DDEV git-ignores it; tracked `config.yaml` untouched) |
+| Database | reusable golden `ddev snapshot`, restored into the clone |
+| Dependencies, media, build artifacts | `cp --reflink` from the source: seconds, no real disk until modified. No reflink support → full copy, reported |
+| Extra services | automatic — DDEV namespaces containers and volumes by project name |
+| `git` inside the containers | generated compose file bind-mounting the main repo's `.git` at its host path |
 
 ## Install
 
@@ -42,18 +33,11 @@ ddev add-on get FluffyDiscord/ddev-agent-env
 cp .ddev/agent-env.yaml.example .ddev/agent-env.yaml
 ```
 
-Edit the copied `.ddev/agent-env.yaml` before the first `create` — the template is a placeholder, not a
-working configuration for your application.
+Edit `.ddev/agent-env.yaml` before the first `create` — the template is a placeholder, not a working config.
 
-Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `curl` and `docker` on the host. Install
-checks those. Works on Linux and macOS. On Linux it uses `flock` for locking and `getent`/`cp --reflink` where
-available; on macOS (or any host without them) it falls back automatically — a `mkdir`-based lock, `python3`
-socket resolution instead of `getent`, and APFS `cp -c` clonefiles (or, failing copy-on-write entirely, full
-copies).
+Requires DDEV ≥ v1.24.10, git ≥ 2.31, and `python3` (with PyYAML), `curl`, `docker` on the host. Install checks those. Linux and macOS: `flock`, `getent` and `cp --reflink` where available, otherwise a `mkdir` lock, `python3` socket resolution, APFS `cp -c`, or full copies.
 
-> **The command installs globally** (`~/.config/ddev/commands/host/agent-env`), so it works in every project.
-> DDEV does not reference-count global files: `ddev add-on remove agent-env` in *any* project deletes it for
-> *all* of them. Install adds `.ddev/addon-metadata/` to your `.gitignore` so a clone cannot uninstall it.
+> **Installs globally** (`~/.config/ddev/commands/host/agent-env`). DDEV does not reference-count global files: `ddev add-on remove agent-env` in *any* project deletes it for *all*. Install adds `.ddev/addon-metadata/` to `.gitignore` so a clone cannot uninstall it.
 
 ## Commands
 
@@ -61,65 +45,63 @@ copies).
 
 | | |
 |---|---|
-| `create <slug>` | Clone into `../<project>-agents/<slug>` on a new `agent/<slug>` branch, as DDEV project `<project>-<slug>`; restore the golden snapshot, start, smoke-test |
-| `list [--stale]` | List clones and their status; `--stale` also shows orphans — a DDEV project with no worktree, a worktree with no DDEV project, a leftover Docker network |
+| `create <slug>` | Clone into `../<project>-agents/<slug>` on branch `agent/<slug>`, as DDEV project `<project>-<slug>`; restore the golden snapshot, start, smoke-test |
+| `list [--stale]` | List clones and status; `--stale` adds orphans — project with no worktree, worktree with no project, leftover Docker network |
 | `path <slug>` | Print the clone's worktree path |
-| `remove [<slug>]` | Delete the clone: DDEV project, database, worktree, branch, leftover network. With no slug, pick from a menu |
-| `refresh-db` | Retake the golden snapshot from the running source project. Run it after schema or seed-data changes so new clones start current |
+| `remove [<slug>]` | Delete DDEV project, database, worktree, branch, leftover network. No slug → menu |
+| `refresh-db` | Retake the golden snapshot from the running source project. Run after schema or seed-data changes |
 
-`create` flags: `--from <ref>` branches from `<ref>` instead of `HEAD`; `--fresh` skips the snapshot restore and
-starts with an empty database; `--fresh-deps` reinstalls the `derived` paths instead of copying them;
-`--with-secrets` keeps real values instead of redacting `env_redact` keys; `--no-start` builds the worktree
-without starting DDEV; `--force` overrides the disk-space, clone-count and DNS checks.
+`create` flags:
 
-`remove` flags: `--yes` (or `-y`) skips the confirmation, so `remove <slug> --yes` runs unattended;
-`--no-interactive` fails instead of opening the menu when no slug is given; `--keep-branch` keeps
-`agent/<slug>`; `--force-delete-branch` deletes it even with unmerged commits.
+| | |
+|---|---|
+| `--from <ref>` | Branch from `<ref>` instead of `HEAD` |
+| `--fresh` | Empty database, skip the snapshot restore |
+| `--fresh-deps` | Reinstall the `derived` paths instead of copying them |
+| `--with-secrets` | Keep real values instead of redacting `env_redact` keys |
+| `--no-start` | Build the worktree, do not start DDEV |
+| `--force` | Override the disk-space, clone-count and DNS checks |
 
-Environment knobs, all optional: `AGENT_ENV_BASE_BRANCH` (branch the unmerged-commit check compares against —
-default: the source project's current branch), `AGENT_ENV_MAX_CLONES`, `AGENT_ENV_WARN_CLONES`,
-`AGENT_ENV_DISK_FLOOR_GB`, `AGENT_ENV_DOCKER_FLOOR_GB`, `AGENT_ENV_LOCK_TIMEOUT`, `AGENT_ENV_SELECT_TIMEOUT`.
+`remove` flags:
+
+| | |
+|---|---|
+| `--yes`, `-y` | Skip confirmation (unattended) |
+| `--no-interactive` | Fail instead of opening the menu when no slug is given |
+| `--keep-branch` | Keep `agent/<slug>` |
+| `--force-delete-branch` | Delete it even with unmerged commits |
+
+Optional env knobs: `AGENT_ENV_BASE_BRANCH` (unmerged-commit comparison, default: the source project's current branch), `AGENT_ENV_MAX_CLONES`, `AGENT_ENV_WARN_CLONES`, `AGENT_ENV_DISK_FLOOR_GB`, `AGENT_ENV_DOCKER_FLOOR_GB`, `AGENT_ENV_LOCK_TIMEOUT`, `AGENT_ENV_SELECT_TIMEOUT`.
 
 ## Configuration
 
-`.ddev/agent-env.yaml` declares the untracked state a fresh worktree lacks. `copy_paths` splits in two because
-`--fresh-deps` replaces only the first:
+`.ddev/agent-env.yaml` declares the untracked state a fresh worktree lacks.
 
-- **`derived`** — regenerable by `composer install` / `npm ci` / a build (`vendor`, `node_modules`, `public/build`)
-- **`materialized`** — nothing regenerates these (`config/jwt/private.pem`, `public/media`, fixture data)
+| Key | Meaning |
+|---|---|
+| `copy_paths.derived` | Regenerable by `composer install` / `npm ci` / a build. `--fresh-deps` replaces only these |
+| `copy_paths.materialized` | Nothing regenerates these — key files, media, fixture data |
+| `env_rewrite_paths` | Copied with the source hostname replaced by the clone's — `MAILER_WEB_URL="https://myproject.ddev.site:8026"` no longer points every agent at the main mailbox |
+| `env_redact` | Named keys blanked to `REDACTED-IN-CLONE` unless `--with-secrets`. Otherwise every clone carries live credentials |
+| `migrations_path` | Default `migrations`. Filenames are recorded with the golden snapshot; `create` warns on drift |
+| `smoke_path` | Default `/`. Requested on the clone's primary URL as the last step of `create` |
+| `smoke_status` | Default `200`. Also a list: `[200, 302]` |
+| `max_clones` | Clone cap |
 
-`env_rewrite_paths` files are copied with the source hostname replaced by the clone's, so a
-`MAILER_WEB_URL="https://myproject.ddev.site:8026"` does not point every agent at the main project's mailbox.
-`env_redact` blanks named keys (`REDACTED-IN-CLONE`) unless you pass `--with-secrets` — every clone otherwise
-carries a live copy of your credentials.
+Migration drift: database ahead of code → `doctrine:migrations:diff` invents duplicates. Code ahead → run migrations before trusting the schema.
 
-`migrations_path` (default `migrations`) names the directory whose filenames are recorded alongside the golden
-snapshot. `create` compares that record against the new worktree and warns when the two have drifted — a clone
-whose database is ahead of its code makes `doctrine:migrations:diff` invent duplicates, and one whose code is
-ahead needs its migration command run before the schema can be trusted. Point it at your migrations directory,
-or ignore it if the project has none.
-
-`smoke_path` (default `/`) and `smoke_status` (default `200`) are the last step of `create`: it requests that
-path on the clone's primary URL and requires that status. The defaults suit an application that serves a page at
-`/`. An API-only backend does not — its `/` is a 404 in the source project too — so point the check at a route
-that answers. A `401` from an authenticated endpoint is a perfectly good smoke test: it proves PHP, routing and
-the restored database are all alive.
+No page at `/`? Point the check at a route that answers; `401` proves PHP, routing and the restored database are alive:
 
 ```yaml
 smoke_path: /api/v1/widget/config
 smoke_status: 401
 ```
 
-`smoke_status` also takes a list — `smoke_status: [200, 302]` — when more than one answer is acceptable; a bare
-number stays valid. `smoke_path` joins with or without a leading slash. A non-numeric `smoke_status`, or a
-`smoke_path` that is a URL rather than a path, fails at the *start* of `create` (exit 14), not after the clone
-is built. When the status simply is not the expected one, the failure names the URL requested and the status
-expected; the "restored data still points at the source project's hostname" hint is kept for the cases where it
-is actually the likely cause — a 5xx, or a redirect to the source project's hostname.
+- Leading slash optional.
+- Non-numeric `smoke_status`, or a `smoke_path` that is a URL → exit 14 at the *start* of `create`.
+- A wrong status names the URL and the expected status; the "restored data still points at the source project's hostname" hint appears only for a 5xx or a redirect to the source hostname.
 
-### A worked example
-
-A fuller `.ddev/agent-env.yaml` for a typical PHP application, and the two rules behind it:
+### Worked example
 
 ```yaml
 copy_paths:
@@ -129,7 +111,7 @@ copy_paths:
     - public/build
     - public/bundles
   materialized:       # nothing regenerates these; a fresh worktree lacks them
-    - config/jwt/private.pem   # per-file, NOT the config/jwt directory — see below
+    - config/jwt/private.pem   # per-file, NOT the config/jwt directory
     - config/jwt/public.pem
     - public/media
     - var/storage
@@ -150,24 +132,14 @@ env_redact:           # blanked to REDACTED-IN-CLONE unless you pass --with-secr
 max_clones: 8
 ```
 
-- **Enumerate a partially-tracked directory file by file.** `config/jwt` already holds tracked files (a
-  `.gitkeep`, a `*-test.pem`), so the worktree checks that directory out *before* the copy runs. `cp -a
-  config/jwt <clone>/config/jwt` into an existing directory nests the real keys at `config/jwt/jwt/private.pem`,
-  and the clone silently starts without a usable key. List the untracked files individually — their targets do
-  not pre-exist, so each lands flat. The same holds for any directory that mixes tracked and git-ignored files.
-- **Redact the credential, copy the key material.** A secret *value* in `.env.local` is blanked by `env_redact`;
-  a key *file* the app reads at runtime (`config/jwt/private.pem`) is untracked artifact like any other and is
-  `materialized`. The two are independent — a clone can have the key file present and the passphrase redacted,
-  in which case that one feature needs `--with-secrets` while the rest of the clone stays scrubbed.
+- **Directories mixing tracked and ignored files: list the untracked files one by one.** The worktree checks out `config/jwt` first, so `cp -a config/jwt <clone>/config/jwt` nests the keys at `config/jwt/jwt/private.pem` and the clone starts without a usable key.
+- **Redact the credential, copy the key material.** `env_redact` blanks a secret *value* in `.env.local`; a key *file* read at runtime is `materialized`. Independent: key file present + passphrase redacted means that one feature needs `--with-secrets`, the rest stays scrubbed.
 
 ## Per-service hooks — use DDEV's, not ours
 
-Anything that must run **in a container** belongs in DDEV's native `hooks:`, not in `agent-env.yaml`. DDEV
-already gives you 25 lifecycle events with a `service:` per task, and — critically — they fire on *every*
-restore, including one an agent runs inside its own clone hours later.
+Container-side work belongs in DDEV's native `hooks:`, not `agent-env.yaml`: 25 lifecycle events, a `service:` per task, and they fire on *every* restore — including one an agent runs inside its own clone hours later.
 
-The canonical case: an application that resolves its site by hostname stores that hostname in the database, so
-a restored clone serves 500 on every page until it is rewritten. In a tracked `.ddev/config.agent-env.yaml`:
+An app that resolves its site by hostname stores that hostname in the database; a restored clone serves 500 until it is rewritten. In a tracked `.ddev/config.agent-env.yaml`:
 
 ```yaml
 hooks:
@@ -177,18 +149,15 @@ hooks:
           [ "$(psql -tAc 'select pg_is_in_recovery()')" = "f" ] && break
           sleep 1
         done
-        psql -v ON_ERROR_STOP=1 -c "UPDATE app_channel SET hostname = regexp_replace(hostname, '[^.]+\.ddev\.site\$', '$DDEV_HOSTNAME')"
+        psql -v ON_ERROR_STOP=1 -c "UPDATE app_channel SET hostname = regexp_replace(hostname, '[^.]+\.ddev\.site\$', '${DDEV_HOSTNAME%%,*}')"
       service: db
 ```
 
-Three things make this work: `DDEV_HOSTNAME` is already the clone's own value inside the container, so there is
-no templating and no injection surface; anchoring the regex on the TLD makes the statement an identity no-op in
-the source project, so one committed hook is correct everywhere; and the `pg_is_in_recovery()` loop covers the
-window where DDEV's Postgres restore reports healthy (`pg_isready`) while the server is still read-only.
+- `DDEV_HOSTNAME` inside the container is the clone's own comma-separated hostname list, primary first — `${DDEV_HOSTNAME%%,*}` takes that one. No templating, no injection surface.
+- Anchoring the regex on the TLD makes the statement an identity no-op in the source project: one committed hook, correct everywhere.
+- The `pg_is_in_recovery()` loop covers the window where DDEV's Postgres restore reports healthy (`pg_isready`) while the server is still read-only.
 
-A second hook can run on another service and **wait on a dependency before it acts**. A restored clone has the
-catalogue back but an empty search index, and a search container reports "running" before the search service
-accepts queries — so the reindex polls readiness first, on the `web` service:
+A hook can wait on a dependency first. A restored clone has the catalogue back but an empty search index, and the container reports "running" before it accepts queries:
 
 ```yaml
     - exec: |
@@ -200,52 +169,34 @@ accepts queries — so the reindex polls readiness first, on the `web` service:
       service: web
 ```
 
-`ddev-${DDEV_SITENAME}-search` resolves to *this* clone's own search container (rule 2 under "Arbitrary extra
-services"), so the one committed hook reindexes each clone against its own restored data.
+`ddev-${DDEV_SITENAME}-search` resolves to *this* clone's search container (rule 2 below), so one committed hook reindexes each clone against its own data.
 
-Clones are created with `fail_on_hook_fail: true`, so a failing hook fails the restore instead of printing a
-warning nobody reads.
+Clones are created with `fail_on_hook_fail: true` — a failing hook fails the restore instead of printing a warning nobody reads.
 
-`agent-env.yaml`'s own `hooks:` holds only the two host-side stages DDEV has no event for: `post_worktree`
-(after files are copied, before `ddev start`) and `pre_remove`.
+`agent-env.yaml`'s own `hooks:` holds only the two host-side stages DDEV has no event for: `post_worktree` (after files are copied, before `ddev start`) and `pre_remove`.
 
 ## Arbitrary extra services
 
-Services you add to `.ddev/docker-compose.*.yaml` clone automatically, because DDEV derives the compose project
-from the project name. Four rules keep that true:
+Services in `.ddev/docker-compose.*.yaml` clone automatically — DDEV derives the compose project from the project name. Four rules keep that true:
 
-1. No fixed host `ports:` — use dynamic bindings or `web_extra_exposed_ports` through the shared router.
+1. No fixed host `ports:` — dynamic bindings or `web_extra_exposed_ports` through the shared router.
 2. No literal `container_name:` — use `ddev-${DDEV_SITENAME}-<service>`.
-3. No literal `com.ddev.approot` / `com.ddev.site-name` labels — use `${DDEV_APPROOT}` / `${DDEV_SITENAME}`.
-   A literal makes the clone's container claim membership in the source project, so `ddev poweroff` there tears
-   the clone's services down.
+3. No literal `com.ddev.approot` / `com.ddev.site-name` labels — use `${DDEV_APPROOT}` / `${DDEV_SITENAME}`. A literal makes the clone's container claim membership in the source project, so `ddev poweroff` there tears the clone's services down.
 4. No `external: true` volumes or networks — those are shared by every clone.
 
-A service's **config** clones; its **data** does not. If a service needs seed state, give it a
-`post-restore-snapshot` or `post-start` hook that rebuilds it — usually cheaper and more correct than copying
-bytes.
+A service's **config** clones; its **data** does not. Seed state belongs in a `post-restore-snapshot` or `post-start` hook that rebuilds it.
 
 ## Safety
 
-- `remove` with no slug opens an arrow-key picker of the worktree-backed clones (a `python3` curses menu,
-  space to toggle, falling back to a numbered prompt where curses is unavailable), lets you select one or
-  more, and always confirms the set before deleting; unknown slugs or branches with unmerged commits abort
-  the whole batch before anything is removed. `--no-interactive` keeps the scriptable behaviour of failing
-  when no slug is given.
-- `remove` refuses to delete a branch with unmerged commits unless `--force-delete-branch`, and prints the tip
-  SHA first so the work is recoverable from the reflog.
-- `remove` reaps the clone's `ddev-<project>_default` Docker network after deleting the project, so the removed
-  clone reclaims its address block. `ddev delete` only frees that network when it runs from the project
-  directory, so an orphaned clone (worktree gone) would otherwise leave the network behind, and enough of them
-  exhaust Docker's default address pool. `list --stale` lists any such leftover networks and the `remove <slug>`
-  that reclaims each.
-- `rm -rf` is guarded to the worktrees root.
+- `remove` with no slug: arrow-key picker of worktree-backed clones (`python3` curses, space toggles; numbered prompt as fallback), multi-select, always confirms. Unknown slugs or unmerged branches abort the whole batch before anything is removed. `--no-interactive` fails instead.
+- `remove` refuses an unmerged branch unless `--force-delete-branch`, and prints the tip SHA for the reflog.
+- `remove` reaps the clone's `ddev-<project>_default` network, reclaiming its address block. `ddev delete` frees it only from the project directory, so orphans exhaust Docker's address pool. `list --stale` lists leftovers and the `remove <slug>` that reclaims each.
+- `rm -rf` guarded to the worktrees root.
 - `create` refuses to run from inside an existing clone.
-- Provisioning is serialized with `flock` (or a `mkdir`-based lock where `flock` is absent, e.g. macOS); the golden snapshot is staged under a temporary name and moved into place, so a `refresh-db` racing a `create` cannot hand out a half-written file.
-- Every failure mode has its own exit code, so an orchestrator can branch without parsing text. An unhandled failure exits 24 rather than masquerading as one of them.
+- Provisioning serialized with `flock` (`mkdir` lock where absent, e.g. macOS); the golden snapshot is staged under a temporary name and moved into place, so `refresh-db` racing a `create` cannot hand out a half-written file.
+- Every failure mode has its own exit code; unhandled failures exit 24.
 
-`ddev poweroff` and `ddev delete --all` are global and will destroy your main project along with every other
-DDEV project on the machine. Nothing here can stop that — deny them in your agent's tooling.
+`ddev poweroff` and `ddev delete --all` are global and destroy your main project along with every other DDEV project on the machine. Nothing here can stop that — deny them in your agent's tooling.
 
 ## Exit codes
 
