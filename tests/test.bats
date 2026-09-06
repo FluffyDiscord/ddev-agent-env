@@ -154,6 +154,23 @@ node_modules" ]
   [[ "$output" == *"it's fine"* ]]
 }
 
+@test "rebasedHostnames succeeds when the project has no config.<name>.yaml" {
+  library
+  printf 'name: testproj\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
+  run rebasedHostnames "testproj-clone"
+  [ "$status" -eq 0 ]
+  [ "$output" = "" ]
+}
+
+@test "rebasedHostnames rebases the parent's additional_hostnames" {
+  library
+  printf 'name: testproj\nadditional_hostnames:\n  - testproj-admin\n  - shop\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
+  run rebasedHostnames "testproj-clone"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"testproj-clone-admin"* ]]
+  [[ "$output" == *"testproj-clone-shop"* ]]
+}
+
 @test "the smoke test falls back to / and 200 when the keys are absent" {
   library
   run getSmokePath '{}';                        [ "$output" = "/" ]

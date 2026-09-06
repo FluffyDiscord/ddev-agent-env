@@ -433,7 +433,9 @@ rebasedHostnames() {
     local target=$1 config
 
     for config in "$DDEV_APPROOT/.ddev/config.yaml" "$DDEV_APPROOT"/.ddev/config.*.yaml; do
-        [ -f "$config" ] && printf '%s\n' "$config"
+        if [ -f "$config" ]; then
+            printf '%s\n' "$config"
+        fi
     done | python3 -c '
 import sys, yaml
 
