@@ -129,7 +129,9 @@ getTargetProject() { echo "$DDEV_PROJECT-$1"; }
 getBranchName() { echo "agent/$1"; }
 getCloneNetworkName() { echo "ddev-$1_default"; }
 getSnapshotDir() { echo "$DDEV_APPROOT/.ddev/db_snapshots"; }
-getSourceHost() { echo "${DDEV_HOSTNAME:-$DDEV_PROJECT.${DDEV_TLD:-ddev.site}}"; }
+# DDEV_HOSTNAME is every hostname the project answers on, comma-separated; the primary one comes
+# first. Matching the whole list against a URL in .env.local never hits, so take the first entry.
+getSourceHost() { local hostnames="${DDEV_HOSTNAME:-$DDEV_PROJECT.${DDEV_TLD:-ddev.site}}"; echo "${hostnames%%,*}"; }
 
 getBaseBranch() {
     if [ -n "${AGENT_ENV_BASE_BRANCH:-}" ]; then

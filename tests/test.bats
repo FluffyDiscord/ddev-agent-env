@@ -249,6 +249,16 @@ node_modules" ]
   [ "$output" = "0" ]
 }
 
+@test "getSourceHost takes the primary name out of DDEV_HOSTNAME's list" {
+  library
+  DDEV_HOSTNAME="testproj.ddev.site,shop.ddev.site,testproj-sk.ddev.site" run getSourceHost
+  [ "$output" = "testproj.ddev.site" ]
+  DDEV_HOSTNAME="testproj.ddev.site" run getSourceHost
+  [ "$output" = "testproj.ddev.site" ]
+  DDEV_HOSTNAME="" run getSourceHost
+  [ "$output" = "testproj.ddev.site" ]
+}
+
 @test "copyEnvFiles rewrites the host and redacts declared keys" {
   library
   printf 'MAILER_WEB_URL="https://src.ddev.site:8026"\nTHIRD_PARTY_SECRET_KEY=live123\nexport THIRD_PARTY_SECRET_KEY=live456\nOTHER_THIRD_PARTY_SECRET_KEY=keepme\n' \
