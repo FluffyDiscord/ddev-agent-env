@@ -15,11 +15,19 @@ DDEV add-on that gives each AI coding agent its own git worktree and DDEV projec
 
 ## Install
 
+Run once, from any DDEV project:
+
 ```bash
 ddev add-on get FluffyDiscord/ddev-agent-env
 ```
 
-> **The command installs globally.** `ddev add-on remove agent-env` in any project removes it for every project on the machine. Install adds `.ddev/addon-metadata/` to your `.gitignore`, so a clone can't uninstall it.
+**The command is global**: every DDEV project on the machine gets `ddev agent-env`. Update it from any project:
+
+```bash
+ddev agent-env self-update
+```
+
+> `ddev add-on remove agent-env` in any project removes it for every project on the machine. Install adds `.ddev/addon-metadata/` to your `.gitignore`, so a clone can't uninstall it.
 
 Needs DDEV v1.24.10 or newer, git 2.31 or newer, and `python3` with PyYAML, `curl` and `docker` on the host. Install checks them all.
 
@@ -46,7 +54,7 @@ Needs DDEV v1.24.10 or newer, git 2.31 or newer, and `python3` with PyYAML, `cur
 
 ## Docs
 
-- [Commands](docs/commands.md) — `create`, `list`, `path`, `remove`, `refresh-db`, environment variables, exit codes
+- [Commands](docs/commands.md) — `create`, `list`, `path`, `remove`, `refresh-db`, `self-update`, environment variables, exit codes
 - [Configuration](docs/configuration.md) — `.ddev/agent-env.yaml`, hostnames, smoke check, migration drift
 - [Hooks and services](docs/hooks-and-services.md) — DDEV hooks for clones, host-side hooks, extra services
 

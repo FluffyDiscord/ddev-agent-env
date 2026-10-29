@@ -177,6 +177,12 @@ The picked set is always confirmed before anything is deleted.
 
 Existing clones keep their database.
 
+## self-update
+
+`ddev agent-env self-update` replaces the global command with the script from the latest GitHub release. Run it from any project; every project gets the new version.
+
+A failed download or a script that doesn't parse leaves the installed command untouched and exits 28.
+
 ## Environment variables
 
 All optional. Set them per call or in your shell profile:
@@ -238,3 +244,4 @@ The clone cap is the `max_clones` key in [agent-env.yaml](configuration.md#optio
 | 25 | `path`, `remove`: there's no such clone, or no clone to pick from. |
 | 26 | `--fresh-deps`: `composer install`, `npm ci` or `npm run build` failed. |
 | 27 | `python3` with PyYAML is missing, or git is older than 2.31. |
+| 28 | `self-update`: the latest release couldn't be read, downloaded or parsed. |

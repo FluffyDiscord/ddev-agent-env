@@ -34,6 +34,10 @@ readonly EXIT_INTERNAL=24
 readonly EXIT_UNKNOWN_SLUG=25
 readonly EXIT_DEPENDENCY_INSTALL=26
 readonly EXIT_HOST_TOOLING=27
+readonly EXIT_SELF_UPDATE=28
+
+readonly LATEST_RELEASE_URL="https://api.github.com/repos/FluffyDiscord/ddev-agent-env/releases/latest"
+readonly RELEASE_SCRIPT_URL="https://raw.githubusercontent.com/FluffyDiscord/ddev-agent-env/%s/commands/host/agent-env"
 
 readonly GOLDEN_SNAPSHOT_NAME=agent-golden
 readonly DNS_LABEL_LIMIT=63
@@ -1219,6 +1223,7 @@ Commands:
                    is unavailable; use 'list --stale' for orphaned projects).
   refresh-db       Retake the golden snapshot from the running source project. Run
                    after schema or seed-data changes so new clones start current.
+  self-update      Replace this global agent-env with the latest GitHub release.
 
 create flags:
   --from <ref>     Branch the worktree from <ref> instead of HEAD.
@@ -1278,6 +1283,7 @@ Exit codes:
   12 host hook failed             25 unknown slug or no clones
   13 clone verification failed    26 --fresh-deps install failed
                                   27 host tooling missing (PyYAML, git 2.31+)
+                                  28 self-update failed
 HELP
 }
 
@@ -1320,6 +1326,27 @@ withLock() {
     acquireLockPortable "$lockFile"
 }
 
+commandSelfUpdate() {
+    [ $# -eq 0 ] || fail $EXIT_BAD_SLUG "self-update takes no arguments"
+
+    local installedScript latestTag scriptUrl download
+    installedScript="${BASH_SOURCE[0]}"
+
+    latestTag=$(curl -fsSL "$LATEST_RELEASE_URL" | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') \
+        || fail $EXIT_SELF_UPDATE "could not read the latest release from GitHub"
+
+    scriptUrl=$(printf "$RELEASE_SCRIPT_URL" "$latestTag")
+    download="$installedScript.download.$$"
+    if ! curl -fsSL "$scriptUrl" -o "$download" || ! bash -n "$download"; then
+        rm -f "$download"
+        fail $EXIT_SELF_UPDATE "could not download a valid script from $scriptUrl"
+    fi
+
+    chmod +x "$download"
+    mv -f "$download" "$installedScript" || fail $EXIT_SELF_UPDATE "could not replace $installedScript"
+    info "agent-env updated to $latestTag ($installedScript)"
+}
+
 main() {
     requireDdevContext
 
@@ -1338,6 +1365,7 @@ main() {
             json=$(readConfigJson) || exit $?
             takeGoldenSnapshot "$(getMigrationsPath "$json")"
             ;;
+        self-update) commandSelfUpdate "$@" ;;
         ""|-h|--help|help) commandHelp ;;
         *) fail $EXIT_BAD_SLUG "unknown subcommand '$subcommand'" ;;
     esac
