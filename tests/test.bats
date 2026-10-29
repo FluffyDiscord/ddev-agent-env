@@ -164,11 +164,12 @@ node_modules" ]
 
 @test "rebasedHostnames rebases the parent's additional_hostnames" {
   library
-  printf 'name: testproj\nadditional_hostnames:\n  - testproj-admin\n  - shop\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
+  printf 'name: testproj\nadditional_hostnames:\n  - testproj-admin\n  - shop\n  - shop.testproj\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
   run rebasedHostnames "testproj-clone"
   [ "$status" -eq 0 ]
   [[ "$output" == *"testproj-clone-admin"* ]]
   [[ "$output" == *"testproj-clone-shop"* ]]
+  [[ "$output" == *"- shop.testproj-clone"* ]]
 }
 
 @test "the smoke test falls back to / and 200 when the keys are absent" {

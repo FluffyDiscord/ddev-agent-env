@@ -428,9 +428,10 @@ open(path, "w").write(stripped)
 
 # additional_hostnames are project-wide names in the router, not per-project ones: a clone that
 # inherited the parent's list would claim the parent's URLs, and whichever container the router
-# picked would answer them. Each name is rebased onto the clone — a name starting with the parent
-# project's gets that prefix swapped, anything else is prefixed — so the clone's aliases mirror
-# the parent's without colliding. Emits nothing when the parent declares none.
+# picked would answer them. Each name is rebased onto the clone — a name with the parent project's
+# name as one of its labels (shop.myapp) or as its prefix (myapp-admin) gets that part swapped,
+# anything else is prefixed — so the clone's aliases mirror the parent's without colliding, and
+# subdomains of the parent stay subdomains of the clone. Emits nothing when the parent declares none.
 rebasedHostnames() {
     local target=$1 config
 
@@ -460,8 +461,11 @@ if not hostnames:
 
 rebased = []
 for name in hostnames:
+    labels = name.split(".")
     if parent and name == parent:
         rebased.append(target)
+    elif parent and parent in labels:
+        rebased.append(".".join(target if label == parent else label for label in labels))
     elif parent and name.startswith(parent + "-"):
         rebased.append(target + name[len(parent):])
     else:
