@@ -1,11 +1,13 @@
 #ddev-generated
 # Copy to .ddev/agent-env.yaml and edit. Paths are relative to the project root.
 #
-# Container-side work does NOT belong here. Use DDEV's own hooks: in a tracked
-# config.*.yaml — they already support per-service tasks and fire on every
-# restore, including ones agent-env never sees. See README "Per-service hooks".
+# Container-side work does NOT belong here. Use DDEV's own hooks in a tracked
+# config.*.yaml — they support per-service tasks and fire on every restore,
+# including ones agent-env never sees. See
+# https://github.com/FluffyDiscord/ddev-agent-env/blob/master/docs/hooks-and-services.md
 
 copy_paths:
+  # Copied copy-on-write. create --fresh-deps skips them and reinstalls instead.
   derived:
     - vendor
     - node_modules
@@ -19,9 +21,11 @@ copy_paths:
     - config/jwt/public.pem
     - public/media
 
+# Copied with the source's hostnames rewritten to the clone's.
 env_rewrite_paths:
   - .env.local
 
+# Keys in env_rewrite_paths set to REDACTED-IN-CLONE (create --with-secrets keeps them).
 env_redact: []
 
 # Filenames here are recorded with the golden snapshot; create warns when a
@@ -38,8 +42,11 @@ migrations_path: migrations
 smoke_path: /
 smoke_status: 200
 
+# Host commands, run in the clone's directory. Each list item is one command;
+# use "- |" for a multi-line script.
 hooks:
   post_worktree: []
   pre_remove: []
 
+# Most clones running at once; create --force ignores it.
 max_clones: 8

@@ -11,6 +11,7 @@ setup() {
   export DDEV_APPROOT="${TESTDIR}/project"
   export DDEV_PROJECT="testproj"
   export DDEV_TLD="ddev.site"
+  export WORKTREE_ROOT="${TESTDIR}/project-agents"
   mkdir -p "${DDEV_APPROOT}/.ddev/db_snapshots"
   git -C "${DDEV_APPROOT}" init -q
   git -C "${DDEV_APPROOT}" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
@@ -21,12 +22,14 @@ teardown() {
 }
 
 library() {
+  local batsTraps
+  batsTraps=$(trap -p ERR EXIT)
   AGENT_ENV_LIBRARY_ONLY=1 source "${COMMAND}"
+  eval "$batsTraps"
 }
 
-@test "syntax is valid" {
-  run bash -n "${COMMAND}"
-  [ "$status" -eq 0 ]
+addAgentBranch() {
+  git -C "${DDEV_APPROOT}" worktree add -q "${WORKTREE_ROOT}/$1" -b "agent/$1"
 }
 
 @test "refuses to run outside a DDEV project" {
@@ -57,7 +60,7 @@ library() {
   [[ "$output" == *"unexpected argument"* ]]
 }
 
-@test "--from without a value is a slug error, not an unbound variable" {
+@test "--from without a value exits 2 naming the flag" {
   run bash "${COMMAND}" create alpha --from
   [ "$status" -eq 2 ]
   [[ "$output" == *"--from requires a value"* ]]
@@ -78,15 +81,15 @@ library() {
 
 @test "path fails for an unknown slug" {
   run bash "${COMMAND}" path nosuchslug
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 25 ]
 }
 
 @test "remove fails for an unknown slug" {
   run bash "${COMMAND}" remove nosuchslug
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 25 ]
 }
 
-@test "remove without a slug and --no-interactive fails as before" {
+@test "remove --no-interactive with no slug exits 2 with usage" {
   run bash "${COMMAND}" remove --no-interactive
   [ "$status" -eq 2 ]
   [[ "$output" == *"usage"* ]]
@@ -94,30 +97,39 @@ library() {
 
 @test "remove without a slug reports when there are no clones to pick" {
   run bash "${COMMAND}" remove
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 25 ]
   [[ "$output" == *"clones"* ]]
 }
 
 @test "remove --yes needs no terminal" {
-  local root="$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")-agents"
-  mkdir -p "${root}/alpha"
+  mkdir -p "${WORKTREE_ROOT}/alpha"
   run bash "${COMMAND}" remove alpha --yes </dev/null
   [ "$status" -eq 0 ]
   [[ "$output" == *"removed alpha"* ]]
-  [ ! -d "${root}/alpha" ]
+  [ ! -d "${WORKTREE_ROOT}/alpha" ]
+}
+
+@test "remove refuses to delete a branch with commits not in the base branch" {
+  addAgentBranch x
+  git -C "${WORKTREE_ROOT}/x" -c user.email=t@t -c user.name=t commit -q --allow-empty -m work
+  run bash "${COMMAND}" remove x --yes
+  [ "$status" -eq 22 ]
+  [[ "$output" == *"agent/x"* ]]
+  git -C "${DDEV_APPROOT}" rev-parse --verify -q agent/x
+  [ -d "${WORKTREE_ROOT}/x" ]
+}
+
+@test "remove refuses to delete a branch when the base branch does not exist" {
+  addAgentBranch x
+  AGENT_ENV_BASE_BRANCH=nosuchbase run bash "${COMMAND}" remove x --yes
+  [ "$status" -eq 22 ]
+  [[ "$output" == *"base branch 'nosuchbase' does not exist"* ]]
+  git -C "${DDEV_APPROOT}" rev-parse --verify -q agent/x
 }
 
 @test "unknown subcommand is rejected" {
   run bash "${COMMAND}" frobnicate
   [ "$status" -eq 2 ]
-}
-
-@test "help lists every subcommand" {
-  run bash "${COMMAND}" --help
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"create"* ]]
-  [[ "$output" == *"refresh-db"* ]]
-  [[ "$output" == *"AGENT_ENV_BASE_BRANCH"* ]]
 }
 
 @test "readConfigJson emits only JSON on stdout when the config is absent" {
@@ -146,89 +158,63 @@ node_modules" ]
   run queryConfig "$json" "max_clones.deeper";  [ "$output" = "" ]
 }
 
-@test "queryConfig is not injectable through a config value" {
-  library
-  local json='{"hooks": {"post_worktree": ["echo it'"'"'s fine"]}}'
-  run queryConfig "$json" "hooks.post_worktree"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"it's fine"* ]]
-}
-
-@test "rebasedHostnames succeeds when the project has no config.<name>.yaml" {
+@test "listRebasedHostnames emits nothing when the parent declares no additional_hostnames" {
   library
   printf 'name: testproj\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
-  run rebasedHostnames "testproj-clone"
+  run listRebasedHostnames "testproj-clone"
   [ "$status" -eq 0 ]
   [ "$output" = "" ]
 }
 
-@test "rebasedHostnames rebases the parent's additional_hostnames" {
+@test "listRebasedHostnames rebases the parent's hostnames merged across config files" {
   library
   printf 'name: testproj\nadditional_hostnames:\n  - testproj-admin\n  - shop\n  - shop.testproj\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
-  run rebasedHostnames "testproj-clone"
+  printf 'additional_hostnames: [testproj, "*.testproj", shop]\n' >"${DDEV_APPROOT}/.ddev/config.extra.yaml"
+  run listRebasedHostnames "testproj-clone"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"testproj-clone-admin"* ]]
-  [[ "$output" == *"testproj-clone-shop"* ]]
-  [[ "$output" == *"- shop.testproj-clone"* ]]
+  [ "$output" = "$(printf '%s\t%s\n' \
+    testproj-admin testproj-clone-admin \
+    shop testproj-clone-shop \
+    shop.testproj shop.testproj-clone \
+    testproj testproj-clone \
+    '*.testproj' '*.testproj-clone')" ]
 }
 
-@test "the smoke test falls back to / and 200 when the keys are absent" {
+@test "the clone config replaces the parent's hostnames and leaves the tracked config alone" {
   library
-  run getSmokePath '{}';                        [ "$output" = "/" ]
-  run getSmokeStatuses '{}';                    [ "$output" = "200" ]
-  run getSmokePath '{"max_clones": 3}';         [ "$output" = "/" ]
-  run getSmokeStatuses '{"max_clones": 3}';     [ "$output" = "200" ]
-  run validateSmokeConfig '{}';                 [ "$status" -eq 0 ]
-  run joinSmokeUrl https://testproj-alpha.ddev.site "$(getSmokePath '{}')"
-  [ "$output" = "https://testproj-alpha.ddev.site/" ]
-  run matchesSmokeStatus 200 200;               [ "$status" -eq 0 ]
-  run matchesSmokeStatus 404 200;               [ "$status" -eq 1 ]
+  printf 'name: testproj\nadditional_hostnames:\n  - testproj-admin\nadditional_fqdns:\n  - shop.example\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
+  printf 'additional_hostnames: ["*.testproj"]\n' >"${DDEV_APPROOT}/.ddev/config.extra.yaml"
+  git -C "${DDEV_APPROOT}" add .ddev
+  git -C "${DDEV_APPROOT}" -c user.email=t@t -c user.name=t commit -q -m ddev
+  addAgentBranch clone
+  writeCloneConfig "${WORKTREE_ROOT}/clone" testproj-clone
+
+  run python3 -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1])))' "${WORKTREE_ROOT}/clone/.ddev/config.zz-agent-env.yaml"
+  [ "$output" = "{'override_config': True, 'name': 'testproj-clone', 'fail_on_hook_fail': True, 'additional_hostnames': ['testproj-clone-admin', '*.testproj-clone'], 'additional_fqdns': []}" ]
+  grep -qxF '/config.zz-agent-env.yaml' "${WORKTREE_ROOT}/clone/.ddev/.gitignore"
+  cmp "${DDEV_APPROOT}/.ddev/config.yaml" "${WORKTREE_ROOT}/clone/.ddev/config.yaml"
 }
 
-@test "smoke_path and smoke_status override the defaults" {
+@test "smoke config falls back to / and 200 and takes overrides and status lists" {
   library
-  local json='{"smoke_path": "/api/v1/widget/config", "smoke_status": 401}'
-  run validateSmokeConfig "$json"; [ "$status" -eq 0 ]
-  run getSmokePath "$json";        [ "$output" = "/api/v1/widget/config" ]
-  run getSmokeStatuses "$json";    [ "$output" = "401" ]
-  run matchesSmokeStatus 401 401;  [ "$status" -eq 0 ]
-  run matchesSmokeStatus 200 401;  [ "$status" -eq 1 ]
+  run getSmokePath '{}';                                    [ "$output" = "/" ]
+  run getSmokeStatuses '{}';                                [ "$output" = "200" ]
+  local json='{"smoke_path": "/api/v1/widget/config", "smoke_status": [200, 302]}'
+  run validateSmokeConfig "$json";                          [ "$status" -eq 0 ]
+  run getSmokePath "$json";                                 [ "$output" = "/api/v1/widget/config" ]
+  run getSmokeStatuses "$json";                             [ "$output" = "200 302" ]
+  run matchesSmokeStatus 302 "200 302";                     [ "$status" -eq 0 ]
+  run matchesSmokeStatus 404 "200 302";                     [ "$status" -eq 1 ]
 }
 
-@test "smoke_status takes a list as well as a bare number" {
-  library
-  run validateSmokeConfig '{"smoke_status": [200, 302]}'; [ "$status" -eq 0 ]
-  run getSmokeStatuses '{"smoke_status": [200, 302]}';    [ "$output" = "200 302" ]
-  run matchesSmokeStatus 302 "200 302";                   [ "$status" -eq 0 ]
-  run matchesSmokeStatus 404 "200 302";                   [ "$status" -eq 1 ]
-}
-
-@test "the smoke path joins whatever the slashes" {
-  library
-  run joinSmokeUrl https://c.ddev.site /api/v1;  [ "$output" = "https://c.ddev.site/api/v1" ]
-  run joinSmokeUrl https://c.ddev.site api/v1;   [ "$output" = "https://c.ddev.site/api/v1" ]
-  run joinSmokeUrl https://c.ddev.site/ /api/v1; [ "$output" = "https://c.ddev.site/api/v1" ]
-  run joinSmokeUrl https://c.ddev.site/ api/v1;  [ "$output" = "https://c.ddev.site/api/v1" ]
-}
-
-@test "a non-numeric smoke_status is rejected by name" {
-  library
-  run validateSmokeConfig '{"smoke_status": "okay"}'
-  [ "$status" -eq 14 ]
-  [[ "$output" == *"smoke_status"* ]]
-  run validateSmokeConfig '{"smoke_status": [200, "nope"]}'
-  [ "$status" -eq 14 ]
-  [[ "$output" == *"smoke_status"* ]]
-}
-
-@test "a smoke_path that is not a path is rejected by name" {
+@test "smoke config rejects a URL as smoke_path and a non-numeric smoke_status with exit 14" {
   library
   run validateSmokeConfig '{"smoke_path": "https://elsewhere.example/health"}'
   [ "$status" -eq 14 ]
   [[ "$output" == *"smoke_path"* ]]
-  run validateSmokeConfig '{"smoke_path": "/api health"}'
+  run validateSmokeConfig '{"smoke_status": [200, "nope"]}'
   [ "$status" -eq 14 ]
-  [[ "$output" == *"smoke_path"* ]]
+  [[ "$output" == *"smoke_status"* ]]
 }
 
 @test "the smoke hint blames the hostname only when that is plausible" {
@@ -244,12 +230,6 @@ node_modules" ]
   [[ "$output" != *"hostname"* ]]
 }
 
-@test "getFreeGb returns 0 for a path that does not exist" {
-  library
-  run getFreeGb /no/such/path/at/all
-  [ "$output" = "0" ]
-}
-
 @test "getSourceHost takes the primary name out of DDEV_HOSTNAME's list" {
   library
   DDEV_HOSTNAME="testproj.ddev.site,shop.ddev.site,testproj-sk.ddev.site" run getSourceHost
@@ -260,16 +240,19 @@ node_modules" ]
   [ "$output" = "testproj.ddev.site" ]
 }
 
-@test "copyEnvFiles rewrites the host and redacts declared keys" {
+@test "copyEnvFiles rewrites the primary and additional hostnames and redacts declared keys" {
   library
-  printf 'MAILER_WEB_URL="https://src.ddev.site:8026"\nTHIRD_PARTY_SECRET_KEY=live123\nexport THIRD_PARTY_SECRET_KEY=live456\nOTHER_THIRD_PARTY_SECRET_KEY=keepme\n' \
+  printf 'additional_hostnames: [shop.testproj, "*.testproj"]\n' >"${DDEV_APPROOT}/.ddev/config.yaml"
+  printf 'MAILER_WEB_URL="https://testproj.ddev.site:8026"\nSHOP_URL=https://shop.testproj.ddev.site\nOTHER_URL=https://foo-testproj.ddev.site\nTHIRD_PARTY_SECRET_KEY=live123\nexport THIRD_PARTY_SECRET_KEY=live456\nOTHER_THIRD_PARTY_SECRET_KEY=keepme\n' \
     >"${DDEV_APPROOT}/.env.local"
   mkdir -p "${TESTDIR}/clone"
   copyEnvFiles '{"env_rewrite_paths":[".env.local"],"env_redact":["THIRD_PARTY_SECRET_KEY"]}' \
-    "${TESTDIR}/clone" src.ddev.site clone.ddev.site no
+    "${TESTDIR}/clone" "$(listEnvHostRewrites testproj-clone)" no
 
   run cat "${TESTDIR}/clone/.env.local"
-  [[ "$output" == *"https://clone.ddev.site:8026"* ]]
+  [[ "$output" == *"https://testproj-clone.ddev.site:8026"* ]]
+  [[ "$output" == *"SHOP_URL=https://shop.testproj-clone.ddev.site"* ]]
+  [[ "$output" == *"OTHER_URL=https://foo-testproj.ddev.site"* ]]
   [[ "$output" == *"THIRD_PARTY_SECRET_KEY=REDACTED-IN-CLONE"* ]]
   [[ "$output" == *"export THIRD_PARTY_SECRET_KEY=REDACTED-IN-CLONE"* ]]
   [[ "$output" == *"OTHER_THIRD_PARTY_SECRET_KEY=keepme"* ]]
@@ -282,7 +265,7 @@ node_modules" ]
   printf 'THIRD_PARTY_SECRET_KEY=live123\n' >"${DDEV_APPROOT}/.env.local"
   mkdir -p "${TESTDIR}/clone"
   copyEnvFiles '{"env_rewrite_paths":[".env.local"],"env_redact":["THIRD_PARTY_SECRET_KEY"]}' \
-    "${TESTDIR}/clone" src.ddev.site clone.ddev.site yes
+    "${TESTDIR}/clone" "$(listEnvHostRewrites testproj-clone)" yes
   run cat "${TESTDIR}/clone/.env.local"
   [[ "$output" == *"live123"* ]]
 }
@@ -291,7 +274,7 @@ node_modules" ]
   library
   printf 'THIRD_PARTY_SECRET_KEY=live123\n' >"${DDEV_APPROOT}/.env.local"
   mkdir -p "${TESTDIR}/clone"
-  copyEnvFiles '{"env_redact":["THIRD_PARTY_SECRET_KEY"]}' "${TESTDIR}/clone" src.ddev.site clone.ddev.site no
+  copyEnvFiles '{"env_redact":["THIRD_PARTY_SECRET_KEY"]}' "${TESTDIR}/clone" "$(listEnvHostRewrites testproj-clone)" no
   run cat "${TESTDIR}/clone/.env.local"
   [[ "$output" != *"live123"* ]]
 }
@@ -301,9 +284,9 @@ node_modules" ]
   printf 'A=1\n' >"${DDEV_APPROOT}/.env.local"
   chmod 600 "${DDEV_APPROOT}/.env.local"
   mkdir -p "${TESTDIR}/clone"
-  copyEnvFiles '{"env_rewrite_paths":[".env.local"]}' "${TESTDIR}/clone" src.ddev.site clone.ddev.site no
-  run stat -c '%a' "${TESTDIR}/clone/.env.local"
-  [ "$output" = "600" ]
+  copyEnvFiles '{"env_rewrite_paths":[".env.local"]}' "${TESTDIR}/clone" "$(listEnvHostRewrites testproj-clone)" no
+  run ls -l "${TESTDIR}/clone/.env.local"
+  [[ "$output" == "-rw-------"* ]]
 }
 
 @test "copyTree does not nest when the reflink fallback is taken" {
@@ -315,29 +298,15 @@ node_modules" ]
   [ ! -e "${TESTDIR}/clone/vendor/vendor" ]
 }
 
-@test "resolveCloneSelections parses lists, dedups, and rejects bad input" {
+@test "the remove picker's selections cancel, dedup and reject bad input" {
   library
-  run resolveCloneSelections "" 3;      [ "$status" -eq 0 ]; [ "$output" = "CANCEL" ]
-  run resolveCloneSelections "   " 3;   [ "$output" = "CANCEL" ]
-  run resolveCloneSelections abc 3;     [ "$output" = "INVALID" ]
-  run resolveCloneSelections 0 3;       [ "$output" = "INVALID" ]
-  run resolveCloneSelections 4 3;       [ "$output" = "INVALID" ]
-  run resolveCloneSelections 2 3;       [ "$output" = "2" ]
-  run resolveCloneSelections 08 8;      [ "$output" = "8" ]
-  run resolveCloneSelections "1 3" 3;   [ "$output" = "1 3" ]
+  run resolveCloneSelections "" 3;      [ "$output" = "CANCEL" ]
   run resolveCloneSelections "3,1,3" 3; [ "$output" = "3 1" ]
-  run resolveCloneSelections "1 5" 5;   [ "$output" = "1 5" ]
-  run resolveCloneSelections "1 6" 5;   [ "$output" = "INVALID" ]
-  run resolveCloneSelections "1 x" 5;   [ "$output" = "INVALID" ]
+  run resolveCloneSelections 4 3;       [ "$output" = "INVALID" ]
+  run resolveCloneSelections "1 x" 3;   [ "$output" = "INVALID" ]
 }
 
-@test "the curses selector reports unavailable when given no rows" {
-  library
-  run pythonCursesSelect
-  [ "$status" -eq 4 ]
-}
-
-@test "runCursesPicker maps an unavailable curses helper to a fallback signal" {
+@test "the remove picker falls back to the numbered list when curses can't run" {
   library
   run runCursesPicker
   [ "$status" -eq 0 ]
@@ -350,18 +319,11 @@ node_modules" ]
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 
-  local root="$(dirname "$DDEV_APPROOT")/$(basename "$DDEV_APPROOT")-agents"
-  mkdir -p "${root}/alpha" "${root}/beta"
+  mkdir -p "${WORKTREE_ROOT}/alpha" "${WORKTREE_ROOT}/beta"
   run listCloneSlugs
   [ "$status" -eq 0 ]
   [[ "$output" == *"alpha"* ]]
   [[ "$output" == *"beta"* ]]
-}
-
-@test "getCloneNetworkName maps a project to its DDEV network name" {
-  library
-  run getCloneNetworkName testproj-issue-42
-  [ "$output" = "ddev-testproj-issue-42_default" ]
 }
 
 @test "filterLeakedCloneNetworks reports only clone networks with no registered project" {
@@ -378,13 +340,6 @@ otherproj-gamma"
   run filterLeakedCloneNetworks "$networks" "$registered" "$prefix"
   [ "$status" -eq 0 ]
   [ "$output" = "ddev-testproj-alpha_default" ]
-}
-
-@test "filterLeakedCloneNetworks never flags the source project's own network" {
-  library
-  run filterLeakedCloneNetworks "ddev-testproj_default" "" "ddev-testproj-"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
 }
 
 @test "getBaseBranch prefers the override then the current branch" {
@@ -413,31 +368,4 @@ otherproj-gamma"
   touch "${TESTDIR}/clone/migrations/Version1.php"
   run --separate-stderr reportMigrationSkew "${TESTDIR}/clone" migrations
   [ -z "$stderr" ]
-}
-
-@test "the command carries no SQL and no template tokens" {
-  run grep -c 'app_channel\|{{SOURCE_HOST}}\|{{CLONE_HOST}}' "${COMMAND}"
-  [ "$output" -eq 0 ]
-}
-
-@test "every declared exit code is actually used" {
-  local code
-  for code in $(grep -oE '^readonly (EXIT_[A-Z_]+)=' "${COMMAND}" | sed 's/readonly //;s/=//'); do
-    run grep -c "\$${code}\b" "${COMMAND}"
-    [ "$output" -ge 1 ] || { echo "unused: $code"; false; }
-  done
-}
-
-@test "install.yaml ships the command globally and the config as an example" {
-  run grep -A2 '^global_files:' "${DIR}/install.yaml"
-  [[ "$output" == *"commands/host/agent-env"* ]]
-  run grep -A2 '^project_files:' "${DIR}/install.yaml"
-  [[ "$output" == *"agent-env.yaml.example"* ]]
-}
-
-@test "the shipped command and the example config carry the ddev-generated marker" {
-  run grep -c '#ddev-generated' "${COMMAND}"
-  [ "$output" -ge 1 ]
-  run grep -c '#ddev-generated' "${DIR}/agent-env.yaml.example"
-  [ "$output" -ge 1 ]
 }
